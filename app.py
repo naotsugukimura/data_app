@@ -17,6 +17,14 @@ from dotenv import load_dotenv
 # app.pyと同じディレクトリの.envを明示的に読み込む（システム環境変数より優先）
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
+
+def get_secret(key: str) -> str:
+    """Streamlit Cloud の secrets → .env の順でキーを取得"""
+    try:
+        return st.secrets[key]
+    except (KeyError, FileNotFoundError):
+        return os.getenv(key, "")
+
 # --- 定数定義 ---
 
 CSV_COLUMNS = [
@@ -181,9 +189,9 @@ def extract_with_anthropic(image_base64: str, media_type: str) -> Optional[dict]
     try:
         import anthropic
 
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        api_key = get_secret("ANTHROPIC_API_KEY")
         if not api_key or api_key.startswith("sk-ant-xxx"):
-            st.error("ANTHROPIC_API_KEYが設定されていません。.envファイルを確認してください。")
+            st.error("ANTHROPIC_API_KEYが設定されていません。.envファイルまたはStreamlit Secretsを確認してください。")
             return None
 
         client = anthropic.Anthropic(api_key=api_key)
@@ -222,9 +230,9 @@ def extract_with_openai(image_base64: str, media_type: str) -> Optional[dict]:
     try:
         from openai import OpenAI
 
-        api_key = os.getenv("OPENAI_API_KEY", "")
+        api_key = get_secret("OPENAI_API_KEY")
         if not api_key or api_key.startswith("sk-xxx"):
-            st.error("OPENAI_API_KEYが設定されていません。.envファイルを確認してください。")
+            st.error("OPENAI_API_KEYが設定されていません。.envファイルまたはStreamlit Secretsを確認してください。")
             return None
 
         client = OpenAI(api_key=api_key)
