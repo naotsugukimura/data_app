@@ -65,40 +65,45 @@ REQUIRED_FIELDS = [
 ]
 
 EXTRACTION_PROMPT = """あなたは障害福祉サービスの書類読み取り専門のアシスタントです。
-アップロードされた画像は「受給者証」または「契約書」です。
 
-以下の項目を画像から読み取り、JSON形式で返してください。
-読み取れない項目は空文字("")としてください。
+## 書類種別の判定
+まず、画像が以下のどちらの書類か判定してください:
+- **受給者証**: 受給者証番号、支給決定期間、モニタリング期間、利用者の住所等が記載された公的書類
+- **利用契約書**: 「利用契約書」というタイトル、契約条項、末尾に署名欄と「令和○年○月○日」の日付がある書類
 
-各項目について、読み取りの確信度を "confidence" オブジェクトに記載してください。
-- "high": はっきり読み取れた
-- "low": 文字が不鮮明、推測が含まれる、または該当項目が書類上に見当たらないが推定した
+判定結果を "書類種別" に記載してください（"受給者証" or "利用契約書"）。
 
-抽出項目:
-1. 事業 — サービス種別。「計画相談支援」「障害児相談支援」など
-2. 利用者_姓
-3. 利用者_名
-4. 利用者_せい — 姓のひらがな読み
-5. 利用者_めい — 名のひらがな読み
-6. 性別 — 男 or 女
-7. 生年月日 — 例: 1990年01月15日
-8. 保護者_姓 — 児童の場合の保護者の姓（該当なければ空文字）
-9. 保護者_名 — 児童の場合の保護者の名（該当なければ空文字）
-10. 契約日 — 利用開始日。例: 2020年08月01日
-11. 受給者証タイプ — 「障がい福祉サービス受給者証」「地域相談支援受給者証」「障がい児通所受給者証」のいずれか
-12. 受給者証番号 — 10桁の数字
-13. 支給決定開始日 — 例: 2023年02月05日
-14. 支給決定満了日 — 例: 2024年02月29日
-15. モニタリング_当初Nか月 — 数字のみ（例: 3）
-16. モニタリング_満了月からNか月ごと — 数字のみ（例: 6）
-17. 郵便番号 — ハイフンなし7桁の数字のみ（例: 8120011）
-18. 都道府県
-19. 住所 — 都道府県より後の部分
-20. 電話番号 — ハイフン付きでOK（例: 092-710-4570）
-21. メールアドレス
+## 抽出ルール
+- 該当する書類に記載のある項目を読み取ってください
+- その書類に該当しない項目は空文字("")としてください
+- 読み取れない項目も空文字("")としてください
+- 各項目の確信度を "confidence" に記載: "high"=はっきり読めた, "low"=不鮮明・推測
 
-回答はJSON形式のみで、余計な説明は不要です。以下の形式で返してください:
+### 受給者証から読み取る項目:
+事業, 利用者_姓, 利用者_名, 利用者_せい, 利用者_めい, 性別, 生年月日,
+保護者_姓, 保護者_名, 受給者証タイプ, 受給者証番号, 支給決定開始日,
+支給決定満了日, モニタリング_当初Nか月, モニタリング_満了月からNか月ごと,
+郵便番号, 都道府県, 住所, 電話番号, メールアドレス
+
+### 利用契約書から読み取る項目:
+利用者_姓, 利用者_名, 契約日（署名欄の「令和○年○月○日」の日付）
+
+## 項目の補足
+- 事業: 「計画相談支援」「障害児相談支援」など
+- 利用者_せい/めい: 姓名のひらがな読み
+- 生年月日: 例 1990年01月15日
+- 保護者_姓/名: 児童の場合のみ（該当なければ空文字）
+- 契約日: 利用契約書の署名欄の日付。和暦でそのまま記載（例: 令和6年4月1日）
+- 受給者証タイプ: 「障がい福祉サービス受給者証」「地域相談支援受給者証」「障がい児通所受給者証」のいずれか
+- 受給者証番号: 10桁の数字
+- 支給決定開始日/満了日: 例 2023年02月05日
+- モニタリング_当初Nか月 / 満了月からNか月ごと: 数字のみ（例: 3, 6）
+- 郵便番号: ハイフンなし7桁（例: 8120011）
+- 電話番号: ハイフン付きOK（例: 092-710-4570）
+
+## 出力形式（JSONのみ、説明不要）
 {
+  "書類種別": "",
   "事業": "",
   "利用者_姓": "",
   "利用者_名": "",
@@ -261,11 +266,30 @@ def parse_json_response(text: str) -> Optional[dict]:
     return None
 
 
+def _convert_wareki_to_seireki(text: str) -> str:
+    """和暦（令和/平成/昭和）をYYYY年MM月DD日形式に変換"""
+    era_map = {"令和": 2018, "平成": 1988, "昭和": 1925}
+    m = re.match(r"(令和|平成|昭和)\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日", text.strip())
+    if m:
+        era, y, month, day = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        year = era_map[era] + y
+        return f"{year}年{month:02d}月{day:02d}日"
+    return text
+
+
 def _postprocess_extraction(result: dict) -> dict:
-    """抽出結果の後処理（郵便番号ハイフン除去など）"""
+    """抽出結果の後処理（郵便番号ハイフン除去、和暦変換など）"""
+    # 郵便番号ハイフン除去
     postal = str(result.get("郵便番号", ""))
     if postal:
         result["郵便番号"] = re.sub(r"[^\d]", "", postal)
+
+    # 日付フィールドの和暦→西暦変換
+    for date_field in ["契約日", "支給決定開始日", "支給決定満了日", "生年月日"]:
+        val = str(result.get(date_field, "")).strip()
+        if val:
+            result[date_field] = _convert_wareki_to_seireki(val)
+
     return result
 
 
@@ -383,11 +407,51 @@ def _match_key(row: dict) -> Optional[str]:
     return None
 
 
+def _name_key(row: dict) -> Optional[str]:
+    """姓名のみの突合キー（利用契約書など生年月日がないケース用）"""
+    sei = str(row.get("利用者_姓", "")).strip()
+    mei = str(row.get("利用者_名", "")).strip()
+    if sei and mei:
+        return f"{sei}|{mei}"
+    return None
+
+
+def _merge_into(existing: dict, data: dict):
+    """既存レコードに新しいデータをマージ（空欄埋め・high優先）"""
+    existing_conf = existing.get("confidence", {})
+    new_conf = data.get("confidence", {})
+    for col in CSV_COLUMNS:
+        new_val = str(data.get(col, "")).strip()
+        old_val = str(existing.get(col, "")).strip()
+        new_c = new_conf.get(col, "low")
+        old_c = existing_conf.get(col, "low")
+        if not old_val and new_val:
+            existing[col] = new_val
+            existing_conf[col] = new_c
+        elif old_val and new_val:
+            if new_c == "high" and old_c == "low":
+                existing[col] = new_val
+                existing_conf[col] = "high"
+            elif len(new_val) > len(old_val) and new_c == old_c:
+                existing[col] = new_val
+    existing["confidence"] = existing_conf
+    src = data.get("_source_file", "")
+    if src and src not in existing.get("_source_files", []):
+        existing.setdefault("_source_files", []).append(src)
+        existing.setdefault("_source_types", []).append(data.get("_doc_type", "不明"))
+
+
 def merge_records(data_list: list[dict]) -> list[dict]:
-    """同一人物のレコードを突合し、空欄をできるだけ埋めたリストを返す"""
+    """同一人物のレコードを突合し、空欄をできるだけ埋めたリストを返す
+
+    2段階突合:
+    1. _match_key（受給者証番号 or 姓名+生年月日）でマッチ
+    2. マッチしなかった分を _name_key（姓名のみ）で既存グループに追加マッチ
+    """
     groups: OrderedDict[str, dict] = OrderedDict()
     unmatched = []
 
+    # 第1段階: 受給者証番号 or 姓名+生年月日
     for data in data_list:
         key = _match_key(data)
         if key is None:
@@ -398,31 +462,28 @@ def merge_records(data_list: list[dict]) -> list[dict]:
             merged = {col: data.get(col, "") for col in CSV_COLUMNS}
             merged["confidence"] = dict(data.get("confidence", {}))
             merged["_source_files"] = [data.get("_source_file", "")]
+            merged["_source_types"] = [data.get("_doc_type", "不明")]
             groups[key] = merged
         else:
-            existing = groups[key]
-            existing_conf = existing.get("confidence", {})
-            new_conf = data.get("confidence", {})
-            for col in CSV_COLUMNS:
-                new_val = str(data.get(col, "")).strip()
-                old_val = str(existing.get(col, "")).strip()
-                new_c = new_conf.get(col, "low")
-                old_c = existing_conf.get(col, "low")
-                if not old_val and new_val:
-                    existing[col] = new_val
-                    existing_conf[col] = new_c
-                elif old_val and new_val:
-                    if new_c == "high" and old_c == "low":
-                        existing[col] = new_val
-                        existing_conf[col] = "high"
-                    elif len(new_val) > len(old_val) and new_c == old_c:
-                        existing[col] = new_val
-            existing["confidence"] = existing_conf
-            src = data.get("_source_file", "")
-            if src and src not in existing.get("_source_files", []):
-                existing.setdefault("_source_files", []).append(src)
+            _merge_into(groups[key], data)
 
-    return list(groups.values()) + unmatched
+    # 第2段階: 姓名のみでマッチ（利用契約書など生年月日がないケース）
+    # 既存グループの姓名キー → グループキーの逆引き辞書を構築
+    name_to_group: dict[str, str] = {}
+    for gkey, gdata in groups.items():
+        nk = _name_key(gdata)
+        if nk:
+            name_to_group[nk] = gkey
+
+    still_unmatched = []
+    for data in unmatched:
+        nk = _name_key(data)
+        if nk and nk in name_to_group:
+            _merge_into(groups[name_to_group[nk]], data)
+        else:
+            still_unmatched.append(data)
+
+    return list(groups.values()) + still_unmatched
 
 
 def build_dataframe(data_list: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
@@ -622,12 +683,14 @@ def render_extraction_section(uploaded_files: list):
 
         if extracted is not None:
             extracted["_source_file"] = fname
+            extracted["_doc_type"] = extracted.get("書類種別", "不明")
             results.append(extracted)
         else:
             if not fname.lower().endswith(".pdf"):
                 st.warning(f"抽出失敗: {fname}")
             empty = {col: "" for col in CSV_COLUMNS}
             empty["_source_file"] = fname
+            empty["_doc_type"] = "不明"
             results.append(empty)
 
         all_images[fname] = image_bytes
@@ -665,7 +728,17 @@ def _render_review_card(
 ):
     """レビューカード1件を描画"""
     name = _get_record_name(data, data_idx)
-    merged_label = f"（書類{len(imgs)}枚を突合）" if len(imgs) > 1 else ""
+    source_types = data.get("_source_types", [])
+
+    if len(imgs) > 1:
+        # 書類種別名を使って突合ラベルを生成（例: 「受給者証＋利用契約書 を突合」）
+        type_names = [t for t in source_types if t != "不明"] if source_types else []
+        if type_names:
+            merged_label = f"（{'＋'.join(type_names)} を突合）"
+        else:
+            merged_label = f"（書類{len(imgs)}枚を突合）"
+    else:
+        merged_label = ""
 
     if pct < 60:
         st.error(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
@@ -678,7 +751,12 @@ def _render_review_card(
 
     with col_img:
         if len(imgs) > 1:
-            img_tabs = st.tabs([f"書類{i + 1}" for i in range(len(imgs))])
+            # タブ名に書類種別を表示（例: 「受給者証 (IMG_001.jpg)」）
+            tab_labels = []
+            for i, (fname, _img_bytes) in enumerate(imgs):
+                doc_type = source_types[i] if i < len(source_types) else f"書類{i + 1}"
+                tab_labels.append(f"{doc_type} ({fname})")
+            img_tabs = st.tabs(tab_labels)
             for i, (fname, img_bytes) in enumerate(imgs):
                 with img_tabs[i]:
                     st.image(img_bytes, caption=fname, use_container_width=True)
