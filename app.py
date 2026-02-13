@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -18,15 +19,9 @@ from dotenv import load_dotenv
 # app.pyと同じディレクトリの.envを明示的に読み込む（システム環境変数より優先）
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
-
-def get_secret(key: str) -> str:
-    """Streamlit Cloud の secrets → .env の順でキーを取得"""
-    try:
-        return st.secrets[key]
-    except (KeyError, FileNotFoundError):
-        return os.getenv(key, "")
-
-# --- 定数定義 ---
+# =============================================================================
+# 定数
+# =============================================================================
 
 CSV_COLUMNS = [
     "サービス利用拠点名",
@@ -44,6 +39,15 @@ CSV_COLUMNS = [
     "郵便番号",
     "都道府県",
     "住所",
+]
+
+REQUIRED_FIELDS = [
+    "利用者_姓",
+    "利用者_名",
+    "生年月日 (YYYY年MM月DD日)",
+    "障害福祉サービス受給者証番号",
+    "支給決定開始日 (YYYY年MM月DD日)",
+    "支給決定終了日 (YYYY年MM月DD日)",
 ]
 
 EXTRACTION_PROMPT = """あなたは障害福祉サービスの書類読み取り専門のアシスタントです。
@@ -110,28 +114,25 @@ EXTRACTION_PROMPT = """あなたは障害福祉サービスの書類読み取り
 }
 """
 
-# 必須項目（空欄だと信頼度が下がる重要フィールド）
-REQUIRED_FIELDS = [
-    "利用者_姓",
-    "利用者_名",
-    "生年月日 (YYYY年MM月DD日)",
-    "障害福祉サービス受給者証番号",
-    "支給決定開始日 (YYYY年MM月DD日)",
-    "支給決定終了日 (YYYY年MM月DD日)",
-]
-
-# アップロード上限枚数
 MAX_FILES = 10
-# プレビューに表示する最大枚数
-PREVIEW_MAX = 10
-# バッチ処理の単位
-BATCH_SIZE = 10
-
-
-# --- ユーティリティ関数 ---
-
-
 MAX_IMAGE_BYTES = 4_500_000  # base64変換後に5MB以内に収まるよう余裕を持たせる
+
+# =============================================================================
+# シークレット取得
+# =============================================================================
+
+
+def get_secret(key: str) -> str:
+    """Streamlit Cloud の secrets → .env の順でキーを取得"""
+    try:
+        return st.secrets[key]
+    except (KeyError, FileNotFoundError):
+        return os.getenv(key, "")
+
+
+# =============================================================================
+# 画像処理
+# =============================================================================
 
 
 def compress_image(image_bytes: bytes, media_type: str) -> tuple[bytes, str]:
@@ -143,9 +144,7 @@ def compress_image(image_bytes: bytes, media_type: str) -> tuple[bytes, str]:
 
     img = Image.open(io.BytesIO(image_bytes))
 
-    # JPEG圧縮で縮小を試みる（品質を段階的に下げる）
     for quality in (85, 70, 50, 35):
-        # 長辺が大きすぎる場合はリサイズ
         max_dim = 2048 if quality >= 70 else 1600
         if max(img.size) > max_dim:
             img.thumbnail((max_dim, max_dim), Image.LANCZOS)
@@ -157,16 +156,10 @@ def compress_image(image_bytes: bytes, media_type: str) -> tuple[bytes, str]:
         if len(result) <= MAX_IMAGE_BYTES:
             return result, "image/jpeg"
 
-    # 最終手段: さらに小さくリサイズ
     img.thumbnail((1200, 1200), Image.LANCZOS)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=30)
     return buf.getvalue(), "image/jpeg"
-
-
-def encode_image_to_base64(image_bytes: bytes) -> str:
-    """画像バイトデータをbase64文字列に変換"""
-    return base64.b64encode(image_bytes).decode("utf-8")
 
 
 def convert_pdf_to_image(pdf_bytes: bytes) -> Optional[bytes]:
@@ -183,7 +176,7 @@ def convert_pdf_to_image(pdf_bytes: bytes) -> Optional[bytes]:
         st.error(
             "pdf2imageがインストールされていません。"
             "また、Popplerのインストールも必要です。\n"
-            "Windows: https://github.com/oschwartz10612/poppler-windows/releases からダウンロード\n"
+            "Windows: https://github.com/oschwartz10612/poppler-windows/releases\n"
             "Mac: `brew install poppler`\n"
             "Linux: `sudo apt-get install poppler-utils`"
         )
@@ -192,10 +185,56 @@ def convert_pdf_to_image(pdf_bytes: bytes) -> Optional[bytes]:
     return None
 
 
-def strip_postal_hyphen(val: str) -> str:
-    """郵便番号からハイフンを除去して数字7桁のみにする"""
-    digits = re.sub(r"[^\d]", "", val)
-    return digits
+def get_media_type(filename: str) -> str:
+    """ファイル名から MIME タイプを判定"""
+    ext = filename.lower().rsplit(".", 1)[-1]
+    return "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+
+
+# =============================================================================
+# AI 抽出
+# =============================================================================
+
+
+def parse_json_response(text: str) -> Optional[dict]:
+    """APIレスポンスからJSONを抽出・パース"""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    if "```" in text:
+        start = text.find("```")
+        end = text.rfind("```")
+        if start != end:
+            json_block = text[start:end]
+            first_newline = json_block.find("\n")
+            if first_newline != -1:
+                json_block = json_block[first_newline + 1:]
+            try:
+                return json.loads(json_block.strip())
+            except json.JSONDecodeError:
+                pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    st.error("AIからのレスポンスをJSON形式で解析できませんでした。")
+    st.code(text, language="text")
+    return None
+
+
+def _postprocess_extraction(result: dict) -> dict:
+    """抽出結果の後処理（郵便番号ハイフン除去など）"""
+    postal = str(result.get("郵便番号", ""))
+    if postal:
+        result["郵便番号"] = re.sub(r"[^\d]", "", postal)
+    return result
 
 
 def extract_with_anthropic(image_base64: str, media_type: str) -> Optional[dict]:
@@ -212,34 +251,16 @@ def extract_with_anthropic(image_base64: str, media_type: str) -> Optional[dict]
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_base64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": EXTRACTION_PROMPT,
-                        },
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
+                    {"type": "text", "text": EXTRACTION_PROMPT},
+                ],
+            }],
         )
-        response_text = message.content[0].text
-        result = parse_json_response(response_text)
-        if result:
-            # 郵便番号のハイフン除去を後処理でも保証
-            postal = str(result.get("郵便番号", ""))
-            if postal:
-                result["郵便番号"] = strip_postal_hyphen(postal)
-        return result
+        result = parse_json_response(message.content[0].text)
+        return _postprocess_extraction(result) if result else None
     except Exception as e:
         st.error(f"Anthropic API エラー: {e}")
         return None
@@ -259,81 +280,31 @@ def extract_with_openai(image_base64: str, media_type: str) -> Optional[dict]:
         response = client.chat.completions.create(
             model="gpt-4o",
             max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{image_base64}",
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": EXTRACTION_PROMPT,
-                        },
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_base64}"}},
+                    {"type": "text", "text": EXTRACTION_PROMPT},
+                ],
+            }],
         )
-        response_text = response.choices[0].message.content
-        result = parse_json_response(response_text)
-        if result:
-            postal = str(result.get("郵便番号", ""))
-            if postal:
-                result["郵便番号"] = strip_postal_hyphen(postal)
-        return result
+        result = parse_json_response(response.choices[0].message.content)
+        return _postprocess_extraction(result) if result else None
     except Exception as e:
         st.error(f"OpenAI API エラー: {e}")
         return None
 
 
-def parse_json_response(text: str) -> Optional[dict]:
-    """APIレスポンスからJSONを抽出・パース"""
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # ```json ... ``` ブロックの抽出を試みる
-    if "```" in text:
-        start = text.find("```")
-        end = text.rfind("```")
-        if start != end:
-            json_block = text[start:end]
-            # ```json のプレフィックスを除去
-            first_newline = json_block.find("\n")
-            if first_newline != -1:
-                json_block = json_block[first_newline + 1 :]
-            try:
-                return json.loads(json_block.strip())
-            except json.JSONDecodeError:
-                pass
-    # { ... } を直接探す
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            pass
-    st.error("AIからのレスポンスをJSON形式で解析できませんでした。")
-    st.code(text, language="text")
-    return None
+# =============================================================================
+# データ処理（信頼度・突合・DataFrame構築）
+# =============================================================================
 
 
 def calc_confidence(data: dict) -> tuple[int, str, list[str]]:
-    """
-    レコードの照合率(%)・判定ラベル・要確認項目リストを返す。
-
-    スコア計算:
-    - 各項目に値があれば加点、空欄なら0点
-    - AIが "high" と回答した項目は満点、"low" は半分
-    - 必須項目は配点2倍
-    """
+    """レコードの照合率(%)・判定ラベル・要確認項目リストを返す"""
     confidence_map = data.get("confidence", {})
     total_weight = 0
-    earned = 0
+    earned = 0.0
     low_fields = []
 
     for col in CSV_COLUMNS:
@@ -352,9 +323,7 @@ def calc_confidence(data: dict) -> tuple[int, str, list[str]]:
 
     pct = int(earned / total_weight * 100) if total_weight else 0
 
-    if pct >= 90 and not any(
-        col in low_fields for col in REQUIRED_FIELDS
-    ):
+    if pct >= 90 and not any(col in low_fields for col in REQUIRED_FIELDS):
         label = "OK"
     elif pct >= 60:
         label = "要確認"
@@ -364,23 +333,9 @@ def calc_confidence(data: dict) -> tuple[int, str, list[str]]:
     return pct, label, low_fields
 
 
-def build_dataframe(data_list: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
-    """抽出データのリストからDataFrame+信頼度情報を構築"""
-    rows = []
-    confidence_info = []
-    for data in data_list:
-        pct, label, low_fields = calc_confidence(data)
-        row = {"判定": label, "照合率": f"{pct}%"}
-        for col in CSV_COLUMNS:
-            row[col] = data.get(col, "")
-        rows.append(row)
-        confidence_info.append({
-            "pct": pct,
-            "label": label,
-            "low_fields": low_fields,
-        })
-    display_cols = ["判定", "照合率"] + CSV_COLUMNS
-    return pd.DataFrame(rows, columns=display_cols), confidence_info
+def is_record_ok(pct: int, low_fields: list[str]) -> bool:
+    """照合率90%以上かつ必須項目に問題なしならTrue"""
+    return pct >= 90 and not any(col in low_fields for col in REQUIRED_FIELDS)
 
 
 def _match_key(row: dict) -> Optional[str]:
@@ -398,8 +353,6 @@ def _match_key(row: dict) -> Optional[str]:
 
 def merge_records(data_list: list[dict]) -> list[dict]:
     """同一人物のレコードを突合し、空欄をできるだけ埋めたリストを返す"""
-    from collections import OrderedDict
-
     groups: OrderedDict[str, dict] = OrderedDict()
     unmatched = []
 
@@ -412,7 +365,6 @@ def merge_records(data_list: list[dict]) -> list[dict]:
         if key not in groups:
             merged = {col: data.get(col, "") for col in CSV_COLUMNS}
             merged["confidence"] = dict(data.get("confidence", {}))
-            # ソースファイル名を保持
             merged["_source_files"] = [data.get("_source_file", "")]
             groups[key] = merged
         else:
@@ -428,14 +380,12 @@ def merge_records(data_list: list[dict]) -> list[dict]:
                     existing[col] = new_val
                     existing_conf[col] = new_c
                 elif old_val and new_val:
-                    # 両方ある場合: high優先、同じならより長い値を採用
                     if new_c == "high" and old_c == "low":
                         existing[col] = new_val
                         existing_conf[col] = "high"
                     elif len(new_val) > len(old_val) and new_c == old_c:
                         existing[col] = new_val
             existing["confidence"] = existing_conf
-            # ソースファイル名をマージ
             src = data.get("_source_file", "")
             if src and src not in existing.get("_source_files", []):
                 existing.setdefault("_source_files", []).append(src)
@@ -443,9 +393,29 @@ def merge_records(data_list: list[dict]) -> list[dict]:
     return list(groups.values()) + unmatched
 
 
+def build_dataframe(data_list: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
+    """抽出データのリストからDataFrame+信頼度情報を構築"""
+    rows = []
+    confidence_info = []
+    for data in data_list:
+        pct, label, low_fields = calc_confidence(data)
+        row = {"判定": label, "照合率": f"{pct}%"}
+        for col in CSV_COLUMNS:
+            row[col] = data.get(col, "")
+        rows.append(row)
+        confidence_info.append({"pct": pct, "label": label, "low_fields": low_fields})
+    display_cols = ["判定", "照合率"] + CSV_COLUMNS
+    return pd.DataFrame(rows, columns=display_cols), confidence_info
+
+
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     """DataFrameをUTF-8 BOM付きCSVバイト列に変換"""
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
+# =============================================================================
+# Google スプレッドシート連携
+# =============================================================================
 
 
 def append_to_google_sheet(df: pd.DataFrame, spreadsheet_url: str, sheet_name: str) -> int:
@@ -464,32 +434,25 @@ def append_to_google_sheet(df: pd.DataFrame, spreadsheet_url: str, sheet_name: s
     sh = gc.open_by_url(spreadsheet_url)
     worksheet = sh.worksheet(sheet_name)
 
-    # ヘッダーが無い場合は1行目に追加
-    existing = worksheet.get_all_values()
-    if not existing:
+    if not worksheet.get_all_values():
         worksheet.append_row(CSV_COLUMNS, value_input_option="USER_ENTERED")
 
-    # DataFrameの各行を追記
     rows = df.fillna("").astype(str).values.tolist()
     worksheet.append_rows(rows, value_input_option="USER_ENTERED")
     return len(rows)
 
 
-# --- Streamlit UI ---
-
+# =============================================================================
+# タブ閉じ防止 JS
+# =============================================================================
 
 _GUARD_ON_JS = """
 <script>
 (function() {
-    // iframe内からtopにアクセス（Streamlit Cloudは同一オリジン）
-    try {
-        var w = window.parent.document ? window.parent : window;
-    } catch(e) {
-        var w = window;
-    }
+    try { var w = window.parent.document ? window.parent : window; }
+    catch(e) { var w = window; }
     function guard(e) { e.preventDefault(); e.returnValue = '処理中です。本当にページを離れますか？'; return e.returnValue; }
     w.addEventListener('beforeunload', guard);
-    // グローバルに保持して後で解除できるようにする
     w.__streamlit_guard = guard;
 })();
 </script>
@@ -498,15 +461,9 @@ _GUARD_ON_JS = """
 _GUARD_OFF_JS = """
 <script>
 (function() {
-    try {
-        var w = window.parent.document ? window.parent : window;
-    } catch(e) {
-        var w = window;
-    }
-    if (w.__streamlit_guard) {
-        w.removeEventListener('beforeunload', w.__streamlit_guard);
-        delete w.__streamlit_guard;
-    }
+    try { var w = window.parent.document ? window.parent : window; }
+    catch(e) { var w = window; }
+    if (w.__streamlit_guard) { w.removeEventListener('beforeunload', w.__streamlit_guard); delete w.__streamlit_guard; }
     w.onbeforeunload = null;
 })();
 </script>
@@ -514,37 +471,23 @@ _GUARD_OFF_JS = """
 
 
 def inject_beforeunload_guard():
-    """処理中にタブを閉じようとしたらブラウザのアラートを出すJS"""
     st.components.v1.html(_GUARD_ON_JS, height=0)
 
 
 def remove_beforeunload_guard():
-    """処理完了後にアラートを解除するJS"""
     st.components.v1.html(_GUARD_OFF_JS, height=0)
 
 
-def main():
-    st.set_page_config(
-        page_title="利用者情報 自動抽出ツール",
-        page_icon="📋",
-        layout="wide",
-    )
+# =============================================================================
+# UI: ① アップロード
+# =============================================================================
 
-    st.title("利用者情報 自動抽出・CSV出力ツール")
-    st.caption("障害福祉サービス事業所向け — 受給者証・契約書からのデータ自動抽出プロトタイプ")
 
-    # API選択（固定: Anthropic）
-    api_provider = "Anthropic (Claude)"
-
-    # 処理中フラグがあればタブ閉じアラートを有効化
-    if st.session_state.get("processing"):
-        inject_beforeunload_guard()
-
-    # --- メインエリア ---
-
-    # ステップ1: ファイルアップロード（複数対応・ドラッグ&ドロップ対応）
+def render_upload_section() -> list:
+    """ファイルアップロードUIを描画し、アップロードされたファイルリストを返す"""
     st.header("① 書類をアップロード")
     st.caption(f"ファイルをドラッグ&ドロップ、またはクリックして選択（最大{MAX_FILES}枚まで）")
+
     uploaded_files = st.file_uploader(
         "受給者証・契約書の画像またはPDFをアップロード",
         type=["jpg", "jpeg", "png", "pdf"],
@@ -554,330 +497,392 @@ def main():
 
     if not uploaded_files:
         st.info("ファイルをドラッグ&ドロップ、またはクリックしてアップロードしてください。")
-        return
+        return []
 
     if len(uploaded_files) > MAX_FILES:
         st.error(f"アップロードは{MAX_FILES}枚までです。現在{len(uploaded_files)}枚選択されています。")
-        return
+        return []
 
-    # アップロード直後はファイル名一覧のみ表示（画像データは読み込まない）
-    file_names = [uf.name for uf in uploaded_files]
-    st.success(f"{len(file_names)}件のファイルを検出しました。")
+    return uploaded_files
 
-    # ステップ2: ファイル一覧（プレビューは折りたたみ内で遅延表示）
-    st.header(f"② アップロードファイル一覧（{len(file_names)}件）")
+
+# =============================================================================
+# UI: ② ファイル一覧
+# =============================================================================
+
+
+def render_file_list(uploaded_files: list):
+    """アップロード済みファイルの一覧とプレビューを描画"""
+    n = len(uploaded_files)
+    st.header(f"② アップロードファイル一覧（{n}件）")
+    st.success(f"{n}件のファイルを検出しました。")
+
     with st.expander("ファイル名一覧", expanded=False):
-        for i, name in enumerate(file_names):
-            st.text(f"{i+1}. {name}")
+        for i, uf in enumerate(uploaded_files):
+            st.text(f"{i + 1}. {uf.name}")
 
-    with st.expander(f"画像プレビュー（先頭{PREVIEW_MAX}件）", expanded=False):
-        preview_count = min(len(uploaded_files), PREVIEW_MAX)
+    with st.expander("画像プレビュー", expanded=False):
         cols = st.columns(3)
-        for i in range(preview_count):
-            uf = uploaded_files[i]
+        for i, uf in enumerate(uploaded_files):
             with cols[i % 3]:
                 st.image(uf, caption=uf.name, use_container_width=True)
 
-    # ステップ3: AI抽出（ボタン押下時に画像を読み込み・処理）
+
+# =============================================================================
+# UI: ③ AI抽出
+# =============================================================================
+
+
+def _extract_single_file(uf) -> tuple[Optional[dict], bytes]:
+    """1ファイルの画像読み込み→圧縮→API抽出を行い (抽出結果, 画像bytes) を返す"""
+    file_bytes = uf.read()
+    fname = uf.name
+
+    if fname.lower().endswith(".pdf"):
+        image_bytes = convert_pdf_to_image(file_bytes)
+        if image_bytes is None:
+            st.warning(f"PDF変換失敗: {fname}")
+            return None, file_bytes
+        mtype = "image/png"
+    else:
+        image_bytes = file_bytes
+        mtype = get_media_type(fname)
+
+    compressed, comp_mtype = compress_image(image_bytes, mtype)
+    image_base64 = base64.b64encode(compressed).decode("utf-8")
+    extracted = extract_with_anthropic(image_base64, comp_mtype)
+
+    return extracted, image_bytes
+
+
+def render_extraction_section(uploaded_files: list):
+    """AI抽出のボタンと処理ロジック"""
     st.header("③ AIによるデータ抽出")
 
-    if st.button("すべてのデータを抽出する", type="primary", use_container_width=True):
-        st.session_state["processing"] = True
+    if not st.button("すべてのデータを抽出する", type="primary", use_container_width=True):
+        return
+
+    st.session_state["processing"] = True
+    inject_beforeunload_guard()
+
+    results = []
+    all_images = {}
+    total = len(uploaded_files)
+    progress = st.progress(0, text=f"抽出中... 0/{total}件 完了")
+
+    for i, uf in enumerate(uploaded_files):
+        progress.progress(i / total, text=f"抽出中... {i}/{total}件 完了")
+
+        extracted, image_bytes = _extract_single_file(uf)
+        fname = uf.name
+
+        if extracted is not None:
+            extracted["_source_file"] = fname
+            results.append(extracted)
+        else:
+            if not fname.lower().endswith(".pdf"):
+                st.warning(f"抽出失敗: {fname}")
+            empty = {col: "" for col in CSV_COLUMNS}
+            empty["_source_file"] = fname
+            results.append(empty)
+
+        all_images[fname] = image_bytes
+
+    progress.progress(1.0, text=f"完了！ {total}/{total}件 抽出しました。")
+
+    merged = merge_records(results)
+    st.session_state["extracted_data"] = merged
+    st.session_state["raw_count"] = len(results)
+    st.session_state["all_images"] = all_images
+    st.session_state["processing"] = False
+    st.rerun()
+
+
+# =============================================================================
+# UI: 画像付きレコード確認・編集
+# =============================================================================
+
+
+def _get_record_name(data: dict, data_idx: int) -> str:
+    """レコードの表示名を取得"""
+    name = f"{data.get('利用者_姓', '')} {data.get('利用者_名', '')}".strip()
+    return name or f"レコード{data_idx + 1}"
+
+
+def _render_review_card(
+    item_idx: int, data_idx: int, data: dict,
+    imgs: list, pct: int, low_fields: list[str],
+    delete_checks: dict,
+):
+    """レビューカード1件を描画"""
+    name = _get_record_name(data, data_idx)
+    merged_label = f"（書類{len(imgs)}枚を突合）" if len(imgs) > 1 else ""
+
+    if pct < 60:
+        st.error(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
+    elif pct < 90:
+        st.warning(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
+    else:
+        st.success(f"**{name}** — 照合率 {pct}%{merged_label}")
+
+    col_img, col_form = st.columns([1, 2])
+
+    with col_img:
+        if len(imgs) > 1:
+            img_tabs = st.tabs([f"書類{i + 1}" for i in range(len(imgs))])
+            for i, (fname, img_bytes) in enumerate(imgs):
+                with img_tabs[i]:
+                    st.image(img_bytes, caption=fname, use_container_width=True)
+        else:
+            st.image(imgs[0][1], caption=imgs[0][0], use_container_width=True)
+
+    with col_form:
+        form_cols = st.columns(3)
+        for fi, col_name in enumerate(CSV_COLUMNS):
+            with form_cols[fi % 3]:
+                is_low = col_name in low_fields
+                label_suffix = " ⚠" if is_low else ""
+                st.text_input(
+                    f"{col_name}{label_suffix}",
+                    value=str(data.get(col_name, "")),
+                    key=f"review_{item_idx}_{col_name}",
+                )
+
+        delete_checks[item_idx] = st.checkbox(
+            "このレコードを削除する",
+            key=f"del_check_{item_idx}",
+        )
+
+    st.divider()
+
+
+def _apply_review_changes(review_items: list, delete_checks: dict, data_list: list):
+    """レビュー結果を data_list に反映し、削除レコードを除去する"""
+    del_indices = set()
+    deleted_files = set()
+
+    for item_idx, (data_idx, _data, imgs, _pct, _lf) in enumerate(review_items):
+        if delete_checks.get(item_idx):
+            del_indices.add(data_idx)
+            deleted_files.update(f for f, _ in imgs)
+        else:
+            for col_name in CSV_COLUMNS:
+                val = st.session_state.get(f"review_{item_idx}_{col_name}", "")
+                data_list[data_idx][col_name] = val
+            if "confidence" in data_list[data_idx]:
+                for col_name in CSV_COLUMNS:
+                    data_list[data_idx]["confidence"][col_name] = "high"
+
+    if del_indices:
+        for idx in sorted(del_indices, reverse=True):
+            data_list.pop(idx)
+        for fn in deleted_files:
+            st.session_state["all_images"].pop(fn, None)
+
+    st.session_state["extracted_data"] = data_list
+
+    applied = len(review_items) - len(del_indices)
+    msg_parts = []
+    if applied:
+        msg_parts.append(f"{applied}件を修正反映")
+    if del_indices:
+        msg_parts.append(f"{len(del_indices)}件を削除")
+    st.success("・".join(msg_parts) + " しました。")
+    st.rerun()
+
+
+def render_review_section():
+    """画像付きレコード確認・編集UI"""
+    if "all_images" not in st.session_state or "extracted_data" not in st.session_state:
+        return
+
+    img_map = st.session_state["all_images"]
+    data_list = st.session_state["extracted_data"]
+
+    review_items = []
+    for idx, data in enumerate(data_list):
+        src_files = data.get("_source_files", [data.get("_source_file", "")])
+        matching_imgs = [(f, img_map[f]) for f in src_files if f in img_map]
+        if matching_imgs:
+            pct, _label, low_fields = calc_confidence(data)
+            review_items.append((idx, data, matching_imgs, pct, low_fields))
+
+    if not review_items:
+        return
+
+    items_ok = [(ii, di, d, im, p, lf)
+                for ii, (di, d, im, p, lf) in enumerate(review_items)
+                if is_record_ok(p, lf)]
+    items_ng = [(ii, di, d, im, p, lf)
+                for ii, (di, d, im, p, lf) in enumerate(review_items)
+                if not is_record_ok(p, lf)]
+
+    st.header("画像付きレコード確認")
+    tab_ng, tab_ok = st.tabs([
+        f"要確認（{len(items_ng)}件）",
+        f"OK（{len(items_ok)}件）",
+    ])
+
+    delete_checks: dict[int, bool] = {}
+
+    with tab_ng:
+        if items_ng:
+            st.caption("修正・削除選択した後、下部の「すべての修正をまとめて反映」で一括反映されます。")
+            for item_idx, data_idx, data, imgs, pct, low_fields in items_ng:
+                _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, delete_checks)
+        else:
+            st.info("要確認レコードはありません。")
+
+    with tab_ok:
+        if items_ok:
+            st.caption("照合率が高いレコードです。内容に問題がなければそのままでOKです。")
+            for item_idx, data_idx, data, imgs, pct, low_fields in items_ok:
+                _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, delete_checks)
+        else:
+            st.info("照合率OKのレコードはありません。")
+
+    if st.button("すべての修正をまとめて反映", type="primary", use_container_width=True):
+        _apply_review_changes(review_items, delete_checks, data_list)
+
+
+# =============================================================================
+# UI: ④ 結果確認・編集 / ⑤ エクスポート
+# =============================================================================
+
+
+def render_results_section():
+    """抽出結果テーブルの表示・編集・CSV/スプレッドシートエクスポート"""
+    if "extracted_data" not in st.session_state:
+        return
+
+    data_list = st.session_state["extracted_data"]
+    raw_count = st.session_state.get("raw_count", len(data_list))
+
+    df, conf_info = build_dataframe(data_list)
+    ok_count = sum(1 for c in conf_info if c["label"] == "OK")
+    review_count = len(conf_info) - ok_count
+
+    # ヘッダー
+    if raw_count != len(data_list):
+        st.header(f"④ 抽出結果の確認・編集（{raw_count}件 → 突合後 {len(data_list)}件）")
+    else:
+        st.header(f"④ 抽出結果の確認・編集（{len(data_list)}件）")
+
+    # サマリー
+    col1, col2, col3 = st.columns(3)
+    col1.metric("OK (確認不要)", f"{ok_count}件")
+    col2.metric("要確認", f"{review_count}件")
+    avg_pct = sum(c["pct"] for c in conf_info) // len(conf_info) if conf_info else 0
+    col3.metric("平均照合率", f"{avg_pct}%")
+
+    # フィルタ
+    view_filter = st.radio("表示フィルタ", ["すべて", "要確認のみ", "OKのみ"], horizontal=True)
+
+    if view_filter == "要確認のみ":
+        mask = df["判定"] != "OK"
+        display_df = df[mask].reset_index(drop=True)
+        display_conf = [c for c in conf_info if c["label"] != "OK"]
+    elif view_filter == "OKのみ":
+        mask = df["判定"] == "OK"
+        display_df = df[mask].reset_index(drop=True)
+        display_conf = [c for c in conf_info if c["label"] == "OK"]
+    else:
+        display_df = df
+        display_conf = conf_info
+
+    # 要確認項目の詳細
+    if display_conf and any(c["low_fields"] for c in display_conf):
+        with st.expander("要確認項目の詳細", expanded=review_count > 0):
+            for i, c in enumerate(display_conf):
+                if c["low_fields"]:
+                    row = display_df.iloc[i]
+                    name = f"{row.get('利用者_姓', '')} {row.get('利用者_名', '')}".strip() or f"行{i + 1}"
+                    st.markdown(f"**{name}** (照合率 {c['pct']}%) — 不明項目: {', '.join(c['low_fields'])}")
+
+    # 編集可能テーブル
+    st.caption("各セルをクリックして直接修正できます。「判定」「照合率」列は出力に含まれません。")
+    edited_df = st.data_editor(
+        display_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        disabled=["判定", "照合率"],
+        key="data_editor",
+    )
+
+    export_df = edited_df[CSV_COLUMNS] if all(c in edited_df.columns for c in CSV_COLUMNS) else edited_df
+
+    # ⑤ CSVダウンロード
+    st.header("⑤ CSVダウンロード")
+    st.download_button(
+        label=f"CSVファイルをダウンロード（{len(export_df)}件）",
+        data=to_csv_bytes(export_df),
+        file_name="利用者情報.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # ⑤' スプレッドシート連携
+    st.header("⑤' スプレッドシートへ反映")
+
+    spreadsheet_url = st.text_input(
+        "Google スプレッドシートのURL",
+        value=st.session_state.get("spreadsheet_url", ""),
+        placeholder="https://docs.google.com/spreadsheets/d/xxxxx/edit",
+    )
+    sheet_name = st.text_input(
+        "シート名",
+        value=st.session_state.get("sheet_name", "シート1"),
+    )
+    st.session_state["spreadsheet_url"] = spreadsheet_url
+    st.session_state["sheet_name"] = sheet_name
+
+    if st.button(
+        f"スプレッドシートに追記する（{len(export_df)}件）",
+        type="primary",
+        use_container_width=True,
+        disabled=not spreadsheet_url,
+    ):
+        try:
+            with st.spinner("スプレッドシートに書き込み中..."):
+                count = append_to_google_sheet(export_df, spreadsheet_url, sheet_name)
+            st.success(f"{count}件のデータをスプレッドシートに追記しました。")
+        except FileNotFoundError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"スプレッドシート書き込みエラー: {e}")
+
+    remove_beforeunload_guard()
+
+
+# =============================================================================
+# メイン
+# =============================================================================
+
+
+def main():
+    st.set_page_config(page_title="利用者情報 自動抽出ツール", page_icon="📋", layout="wide")
+    st.title("利用者情報 自動抽出・CSV出力ツール")
+    st.caption("障害福祉サービス事業所向け — 受給者証・契約書からのデータ自動抽出プロトタイプ")
+
+    if st.session_state.get("processing"):
         inject_beforeunload_guard()
 
-        results = []
-        file_conf_map = {}  # file_name -> confidence_pct
-        all_images = {}  # 全ファイルの画像を保持（マージ時の参照用）
-        total = len(uploaded_files)
-        progress = st.progress(0, text=f"抽出中... 0/{total}件 完了")
+    # ① アップロード
+    uploaded_files = render_upload_section()
+    if not uploaded_files:
+        return
 
-        for i, uf in enumerate(uploaded_files):
-            fname = uf.name
-            progress.progress(i / total, text=f"抽出中... {i}/{total}件 完了")
+    # ② ファイル一覧
+    render_file_list(uploaded_files)
 
-            # ここで初めて画像データを読み込む（遅延読み込み）
-            file_bytes = uf.read()
-            is_pdf = fname.lower().endswith(".pdf")
+    # ③ AI抽出
+    render_extraction_section(uploaded_files)
 
-            if is_pdf:
-                image_bytes = convert_pdf_to_image(file_bytes)
-                if image_bytes is None:
-                    st.warning(f"PDF変換失敗: {fname}")
-                    file_conf_map[fname] = 0
-                    results.append({col: "" for col in CSV_COLUMNS})
-                    continue
-                mtype = "image/png"
-            else:
-                image_bytes = file_bytes
-                ext = fname.lower().rsplit(".", 1)[-1]
-                mtype = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+    # 画像付きレコード確認・編集
+    render_review_section()
 
-            compressed, comp_mtype = compress_image(image_bytes, mtype)
-            image_base64 = encode_image_to_base64(compressed)
-            if api_provider == "Anthropic (Claude)":
-                extracted = extract_with_anthropic(image_base64, comp_mtype)
-            else:
-                extracted = extract_with_openai(image_base64, comp_mtype)
-
-            if extracted is not None:
-                extracted["_source_file"] = fname
-                results.append(extracted)
-                pct, _, _ = calc_confidence(extracted)
-                file_conf_map[fname] = pct
-            else:
-                st.warning(f"抽出失敗: {fname}")
-                empty = {col: "" for col in CSV_COLUMNS}
-                empty["_source_file"] = fname
-                results.append(empty)
-                file_conf_map[fname] = 0
-
-            # 全画像を保持（マージレコードでも全ソース画像を表示するため）
-            all_images[fname] = image_bytes
-
-        progress.progress(1.0, text=f"完了！ {total}/{total}件 抽出しました。")
-
-        # 同一人物のレコードを突合
-        merged = merge_records(results)
-        st.session_state["extracted_data"] = merged
-        st.session_state["raw_count"] = len(results)
-        st.session_state["file_conf_map"] = file_conf_map
-        st.session_state["all_images"] = all_images
-        st.session_state["processing"] = False
-        st.rerun()
-
-    # ステップ3.5: 画像付きレコード確認・編集
-    if ("all_images" in st.session_state
-        and "extracted_data" in st.session_state):
-
-        img_map = st.session_state["all_images"]
-        data_list = st.session_state["extracted_data"]
-
-        # 全レコードのうちソース画像があるものを確認対象にする
-        review_items = []
-        for idx, data in enumerate(data_list):
-            src_files = data.get("_source_files", [data.get("_source_file", "")])
-            matching_imgs = [(f, img_map[f]) for f in src_files if f in img_map]
-            if matching_imgs:
-                pct, label, low_fields = calc_confidence(data)
-                review_items.append((idx, data, matching_imgs, pct, low_fields))
-
-        if review_items:
-            # OK（照合率90%以上かつ必須項目lowなし）と要確認に分離
-            items_ok = [(ii, di, d, im, p, lf) for ii, (di, d, im, p, lf)
-                        in enumerate(review_items)
-                        if p >= 90 and not any(c in lf for c in REQUIRED_FIELDS)]
-            items_ng = [(ii, di, d, im, p, lf) for ii, (di, d, im, p, lf)
-                        in enumerate(review_items)
-                        if not (p >= 90 and not any(c in lf for c in REQUIRED_FIELDS))]
-
-            st.header("画像付きレコード確認")
-            tab_ng, tab_ok = st.tabs([
-                f"要確認（{len(items_ng)}件）",
-                f"OK（{len(items_ok)}件）",
-            ])
-
-            # 削除チェック用（両タブ共通）
-            delete_checks = {}
-
-            def _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, prefix):
-                """レビューカード1件を描画"""
-                name = f"{data.get('利用者_姓', '')} {data.get('利用者_名', '')}".strip() or f"レコード{data_idx+1}"
-                merged_label = f"（書類{len(imgs)}枚を突合）" if len(imgs) > 1 else ""
-                if pct < 60:
-                    st.error(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
-                elif pct < 90:
-                    st.warning(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
-                else:
-                    st.success(f"**{name}** — 照合率 {pct}%{merged_label}")
-
-                col_img, col_form = st.columns([1, 2])
-
-                with col_img:
-                    if len(imgs) > 1:
-                        img_tabs = st.tabs([f"書類{i+1}" for i in range(len(imgs))])
-                        for i, (fname, img_bytes) in enumerate(imgs):
-                            with img_tabs[i]:
-                                st.image(img_bytes, caption=fname, use_container_width=True)
-                    else:
-                        fname, img_bytes = imgs[0]
-                        st.image(img_bytes, caption=fname, use_container_width=True)
-
-                with col_form:
-                    form_cols = st.columns(3)
-                    for fi, col_name in enumerate(CSV_COLUMNS):
-                        with form_cols[fi % 3]:
-                            is_low = col_name in low_fields
-                            current_val = str(data.get(col_name, ""))
-                            label_suffix = " ⚠" if is_low else ""
-                            st.text_input(
-                                f"{col_name}{label_suffix}",
-                                value=current_val,
-                                key=f"review_{item_idx}_{col_name}",
-                            )
-
-                    delete_checks[item_idx] = st.checkbox(
-                        "このレコードを削除する",
-                        key=f"del_check_{item_idx}",
-                    )
-
-                st.divider()
-
-            with tab_ng:
-                if items_ng:
-                    st.caption("修正・削除選択した後、下部の「すべての修正をまとめて反映」で一括反映されます。")
-                    for item_idx, data_idx, data, imgs, pct, low_fields in items_ng:
-                        _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, "ng")
-                else:
-                    st.info("要確認レコードはありません。")
-
-            with tab_ok:
-                if items_ok:
-                    st.caption("照合率が高いレコードです。内容に問題がなければそのままでOKです。")
-                    for item_idx, data_idx, data, imgs, pct, low_fields in items_ok:
-                        _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, "ok")
-                else:
-                    st.info("照合率OKのレコードはありません。")
-
-            # 一括反映ボタン（両タブ共通）
-            if st.button("すべての修正をまとめて反映", type="primary", use_container_width=True):
-                del_indices = set()
-                deleted_files = set()
-
-                for item_idx, (data_idx, data, imgs, pct, low_fields) in enumerate(review_items):
-                    if delete_checks.get(item_idx):
-                        del_indices.add(data_idx)
-                        deleted_files.update(f for f, _ in imgs)
-                    else:
-                        for col_name in CSV_COLUMNS:
-                            val = st.session_state.get(f"review_{item_idx}_{col_name}", "")
-                            data_list[data_idx][col_name] = val
-                        if "confidence" in data_list[data_idx]:
-                            for col_name in CSV_COLUMNS:
-                                data_list[data_idx]["confidence"][col_name] = "high"
-
-                if del_indices:
-                    for idx in sorted(del_indices, reverse=True):
-                        data_list.pop(idx)
-                    # 削除したレコードの画像もマップから除去
-                    for fn in deleted_files:
-                        st.session_state["all_images"].pop(fn, None)
-
-                st.session_state["extracted_data"] = data_list
-                applied = len(review_items) - len(del_indices)
-                msg_parts = []
-                if applied:
-                    msg_parts.append(f"{applied}件を修正反映")
-                if del_indices:
-                    msg_parts.append(f"{len(del_indices)}件を削除")
-                st.success("・".join(msg_parts) + " しました。")
-                st.rerun()
-
-    # ステップ4: 結果確認・編集
-    if "extracted_data" in st.session_state:
-        data_list = st.session_state["extracted_data"]
-        raw_count = st.session_state.get("raw_count", len(data_list))
-
-        df, conf_info = build_dataframe(data_list)
-        ok_count = sum(1 for c in conf_info if c["label"] == "OK")
-        review_count = len(conf_info) - ok_count
-
-        if raw_count != len(data_list):
-            st.header(f"④ 抽出結果の確認・編集（{raw_count}件 → 突合後 {len(data_list)}件）")
-        else:
-            st.header(f"④ 抽出結果の確認・編集（{len(data_list)}件）")
-
-        # サマリー表示
-        col1, col2, col3 = st.columns(3)
-        col1.metric("OK (確認不要)", f"{ok_count}件")
-        col2.metric("要確認", f"{review_count}件")
-        col3.metric("平均照合率", f"{sum(c['pct'] for c in conf_info) // len(conf_info)}%")
-
-        # フィルタ
-        view_filter = st.radio(
-            "表示フィルタ",
-            ["すべて", "要確認のみ", "OKのみ"],
-            horizontal=True,
-        )
-
-        if view_filter == "要確認のみ":
-            mask = df["判定"] != "OK"
-            display_df = df[mask].reset_index(drop=True)
-            display_conf = [c for c in conf_info if c["label"] != "OK"]
-        elif view_filter == "OKのみ":
-            mask = df["判定"] == "OK"
-            display_df = df[mask].reset_index(drop=True)
-            display_conf = [c for c in conf_info if c["label"] == "OK"]
-        else:
-            display_df = df
-            display_conf = conf_info
-
-        # 要確認項目の詳細表示
-        if display_conf and any(c["low_fields"] for c in display_conf):
-            with st.expander("要確認項目の詳細", expanded=review_count > 0):
-                for i, c in enumerate(display_conf):
-                    if c["low_fields"]:
-                        name = display_df.iloc[i].get("利用者_姓", "") + " " + display_df.iloc[i].get("利用者_名", "")
-                        name = name.strip() or f"行{i+1}"
-                        st.markdown(
-                            f"**{name}** (照合率 {c['pct']}%) — "
-                            f"不明項目: {', '.join(c['low_fields'])}"
-                        )
-
-        st.caption("各セルをクリックして直接修正できます。「判定」「照合率」列は出力に含まれません。")
-        edited_df = st.data_editor(
-            display_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            disabled=["判定", "照合率"],
-            key="data_editor",
-        )
-
-        # CSV出力用にはデータ列のみ抽出
-        export_df = edited_df[CSV_COLUMNS] if all(c in edited_df.columns for c in CSV_COLUMNS) else edited_df
-
-        # ステップ5: CSVダウンロード
-        st.header("⑤ CSVダウンロード")
-        csv_bytes = to_csv_bytes(export_df)
-        st.download_button(
-            label=f"CSVファイルをダウンロード（{len(export_df)}件）",
-            data=csv_bytes,
-            file_name="利用者情報.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        # ステップ5': スプレッドシートへ反映（PoC）
-        st.header("⑤' スプレッドシートへ反映")
-
-        spreadsheet_url = st.text_input(
-            "Google スプレッドシートのURL",
-            value=st.session_state.get("spreadsheet_url", ""),
-            placeholder="https://docs.google.com/spreadsheets/d/xxxxx/edit",
-        )
-        sheet_name = st.text_input(
-            "シート名",
-            value=st.session_state.get("sheet_name", "シート1"),
-        )
-        st.session_state["spreadsheet_url"] = spreadsheet_url
-        st.session_state["sheet_name"] = sheet_name
-
-        if st.button(
-            f"スプレッドシートに追記する（{len(export_df)}件）",
-            type="primary",
-            use_container_width=True,
-            disabled=not spreadsheet_url,
-        ):
-            try:
-                with st.spinner("スプレッドシートに書き込み中..."):
-                    count = append_to_google_sheet(export_df, spreadsheet_url, sheet_name)
-                st.success(f"{count}件のデータをスプレッドシートに追記しました。")
-            except FileNotFoundError as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error(f"スプレッドシート書き込みエラー: {e}")
-
-        # 処理完了後のアラート解除
-        remove_beforeunload_guard()
+    # ④⑤ 結果テーブル・エクスポート
+    render_results_section()
 
 
 if __name__ == "__main__":
