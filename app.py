@@ -675,18 +675,32 @@ def main():
                 review_items.append((idx, data, matching_imgs, pct, low_fields))
 
         if review_items:
-            st.header(f"⚠ 要確認レコード（{len(review_items)}件）— 画像を見ながら修正")
-            st.caption("各レコードを修正・削除選択した後、ページ下部の「すべての修正をまとめて反映」で一括反映されます。")
+            # OK（照合率90%以上かつ必須項目lowなし）と要確認に分離
+            items_ok = [(ii, di, d, im, p, lf) for ii, (di, d, im, p, lf)
+                        in enumerate(review_items)
+                        if p >= 90 and not any(c in lf for c in REQUIRED_FIELDS)]
+            items_ng = [(ii, di, d, im, p, lf) for ii, (di, d, im, p, lf)
+                        in enumerate(review_items)
+                        if not (p >= 90 and not any(c in lf for c in REQUIRED_FIELDS))]
 
-            # 削除チェック用
+            st.header("画像付きレコード確認")
+            tab_ng, tab_ok = st.tabs([
+                f"要確認（{len(items_ng)}件）",
+                f"OK（{len(items_ok)}件）",
+            ])
+
+            # 削除チェック用（両タブ共通）
             delete_checks = {}
 
-            for item_idx, (data_idx, data, imgs, pct, low_fields) in enumerate(review_items):
+            def _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, prefix):
+                """レビューカード1件を描画"""
                 name = f"{data.get('利用者_姓', '')} {data.get('利用者_名', '')}".strip() or f"レコード{data_idx+1}"
                 if pct < 60:
                     st.error(f"**{name}** — 照合率 {pct}%　不明項目: {', '.join(low_fields)}")
-                else:
+                elif pct < 90:
                     st.warning(f"**{name}** — 照合率 {pct}%　不明項目: {', '.join(low_fields)}")
+                else:
+                    st.success(f"**{name}** — 照合率 {pct}%")
 
                 col_img, col_form = st.columns([1, 2])
 
@@ -714,7 +728,23 @@ def main():
 
                 st.divider()
 
-            # 一括反映ボタン
+            with tab_ng:
+                if items_ng:
+                    st.caption("修正・削除選択した後、下部の「すべての修正をまとめて反映」で一括反映されます。")
+                    for item_idx, data_idx, data, imgs, pct, low_fields in items_ng:
+                        _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, "ng")
+                else:
+                    st.info("要確認レコードはありません。")
+
+            with tab_ok:
+                if items_ok:
+                    st.caption("照合率が高いレコードです。内容に問題がなければそのままでOKです。")
+                    for item_idx, data_idx, data, imgs, pct, low_fields in items_ok:
+                        _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, "ok")
+                else:
+                    st.info("照合率OKのレコードはありません。")
+
+            # 一括反映ボタン（両タブ共通）
             if st.button("すべての修正をまとめて反映", type="primary", use_container_width=True):
                 del_indices = set()
                 deleted_files = set()
@@ -724,7 +754,6 @@ def main():
                         del_indices.add(data_idx)
                         deleted_files.update(f for f, _ in imgs)
                     else:
-                        # 修正値を反映
                         for col_name in CSV_COLUMNS:
                             val = st.session_state.get(f"review_{item_idx}_{col_name}", "")
                             data_list[data_idx][col_name] = val
@@ -732,7 +761,6 @@ def main():
                             for col_name in CSV_COLUMNS:
                                 data_list[data_idx]["confidence"][col_name] = "high"
 
-                # 削除実行（インデックスが大きい方から消す）
                 if del_indices:
                     for idx in sorted(del_indices, reverse=True):
                         data_list.pop(idx)
