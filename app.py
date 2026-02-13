@@ -4,10 +4,12 @@
 """
 
 import base64
+import concurrent.futures
 import io
 import json
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -626,8 +628,12 @@ def render_file_list(uploaded_files: list):
 # =============================================================================
 
 
-def _extract_single_file(uf) -> tuple[Optional[dict], bytes]:
-    """1ファイルの画像読み込み→圧縮→API抽出を行い (抽出結果, 画像bytes) を返す"""
+def _prepare_file(uf) -> tuple[str, bytes, Optional[str], Optional[str]]:
+    """ファイルを読み込み・圧縮してAPI呼び出し用データを準備する（メインスレッドで実行）
+
+    Returns: (fname, image_bytes, image_base64, media_type)
+        image_base64がNoneの場合は準備失敗
+    """
     file_bytes = uf.read()
     fname = uf.name
 
@@ -635,7 +641,7 @@ def _extract_single_file(uf) -> tuple[Optional[dict], bytes]:
         image_bytes = convert_pdf_to_image(file_bytes)
         if image_bytes is None:
             st.warning(f"PDF変換失敗: {fname}")
-            return None, file_bytes
+            return fname, file_bytes, None, None
         mtype = "image/png"
     else:
         image_bytes = file_bytes
@@ -643,13 +649,20 @@ def _extract_single_file(uf) -> tuple[Optional[dict], bytes]:
 
     compressed, comp_mtype = compress_image(image_bytes, mtype)
     image_base64 = base64.b64encode(compressed).decode("utf-8")
-    extracted = extract_with_anthropic(image_base64, comp_mtype)
+    return fname, image_bytes, image_base64, comp_mtype
 
-    return extracted, image_bytes
+
+def _call_api(fname: str, image_base64: str, media_type: str) -> tuple[str, Optional[dict]]:
+    """API呼び出しのみ（ワーカースレッドで実行）"""
+    extracted = extract_with_anthropic(image_base64, media_type)
+    return fname, extracted
+
+
+MAX_PARALLEL = 3  # 並列API呼び出し数
 
 
 def render_extraction_section(uploaded_files: list):
-    """AI抽出のボタンと処理ロジック"""
+    """AI抽出のボタンと処理ロジック（並列API呼び出し対応）"""
     st.header("③ AIによるデータ抽出")
 
     if not st.button("すべてのデータを抽出する", type="primary", use_container_width=True):
@@ -658,28 +671,71 @@ def render_extraction_section(uploaded_files: list):
     st.session_state["processing"] = True
     inject_beforeunload_guard()
 
-    results = []
-    all_images = {}
     total = len(uploaded_files)
     progress = st.progress(0, text=f"抽出中... 0/{total}件 完了")
     start_time = time.time()
 
-    for i, uf in enumerate(uploaded_files):
-        # 残り時間の推定
-        if i > 0:
-            elapsed = time.time() - start_time
-            avg_sec = elapsed / i
-            remaining = avg_sec * (total - i)
+    # ── 第1段階: ファイル読み込み・圧縮（メインスレッド、高速） ──
+    prepared = []  # [(fname, image_bytes, image_base64, media_type), ...]
+    for uf in uploaded_files:
+        prepared.append(_prepare_file(uf))
+
+    # ── 第2段階: API呼び出しを並列実行 ──
+    all_images = {}
+    api_results: dict[str, Optional[dict]] = {}  # fname → extracted
+    completed = 0
+    lock = threading.Lock()
+
+    # 準備成功したもののみAPI呼び出し
+    api_tasks = [(fname, img_b64, mtype)
+                 for fname, _img_bytes, img_b64, mtype in prepared
+                 if img_b64 is not None]
+
+    def _on_complete(fname: str):
+        """完了カウント更新（スレッドセーフ）"""
+        nonlocal completed
+        with lock:
+            completed += 1
+            c = completed
+
+        elapsed = time.time() - start_time
+        if c > 0 and c < total:
+            avg_sec = elapsed / c
+            remaining = avg_sec * (total - c)
             if remaining >= 60:
                 eta = f"（残り約{int(remaining // 60)}分{int(remaining % 60)}秒）"
             else:
                 eta = f"（残り約{int(remaining)}秒）"
         else:
             eta = ""
-        progress.progress(i / total, text=f"抽出中... {i}/{total}件 完了 {eta}")
+        progress.progress(c / total, text=f"抽出中... {c}/{total}件 完了 {eta}")
 
-        extracted, image_bytes = _extract_single_file(uf)
-        fname = uf.name
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
+        futures = {}
+        for fname, img_b64, mtype in api_tasks:
+            future = executor.submit(_call_api, fname, img_b64, mtype)
+            futures[future] = fname
+
+        for future in concurrent.futures.as_completed(futures):
+            fname, extracted = future.result()
+            api_results[fname] = extracted
+            _on_complete(fname)
+
+    # 準備失敗分もカウント
+    for fname, _img_bytes, img_b64, _mtype in prepared:
+        if img_b64 is None and fname not in api_results:
+            api_results[fname] = None
+            completed += 1
+            progress.progress(
+                min(completed / total, 1.0),
+                text=f"抽出中... {completed}/{total}件 完了",
+            )
+
+    # ── 第3段階: 結果を元の順序で組み立て ──
+    results = []
+    for fname, image_bytes, _img_b64, _mtype in prepared:
+        all_images[fname] = image_bytes
+        extracted = api_results.get(fname)
 
         if extracted is not None:
             extracted["_source_file"] = fname
@@ -692,8 +748,6 @@ def render_extraction_section(uploaded_files: list):
             empty["_source_file"] = fname
             empty["_doc_type"] = "不明"
             results.append(empty)
-
-        all_images[fname] = image_bytes
 
     elapsed_total = time.time() - start_time
     if elapsed_total >= 60:
