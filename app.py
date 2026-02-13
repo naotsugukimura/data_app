@@ -705,16 +705,44 @@ def main():
                                 key=f"review_{item_idx}_{col_name}",
                             )
 
-                    if st.button(f"この修正を反映する", key=f"apply_{item_idx}"):
-                        for col_name, val in edited_values.items():
-                            data_list[data_idx][col_name] = val
-                        # confidence情報をhighに更新（人が確認済み）
-                        if "confidence" in data_list[data_idx]:
-                            for col_name in CSV_COLUMNS:
-                                data_list[data_idx]["confidence"][col_name] = "high"
-                        st.session_state["extracted_data"] = data_list
-                        st.success(f"**{name}** のデータを反映しました。")
-                        st.rerun()
+                    btn_apply, btn_del = st.columns(2)
+                    with btn_apply:
+                        if st.button("この修正を反映する", key=f"apply_{item_idx}"):
+                            for col_name, val in edited_values.items():
+                                data_list[data_idx][col_name] = val
+                            if "confidence" in data_list[data_idx]:
+                                for col_name in CSV_COLUMNS:
+                                    data_list[data_idx]["confidence"][col_name] = "high"
+                            st.session_state["extracted_data"] = data_list
+                            st.success(f"**{name}** のデータを反映しました。")
+                            st.rerun()
+                    with btn_del:
+                        del_key = f"confirm_del_{item_idx}"
+                        if st.session_state.get(del_key):
+                            # 確認状態: 本当に削除するか聞く
+                            st.error(f"**{name}** のデータを完全に削除しますか？")
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button("はい、削除する", key=f"do_del_{item_idx}", type="primary"):
+                                    data_list.pop(data_idx)
+                                    st.session_state["extracted_data"] = data_list
+                                    # 削除した画像をレビューリストからも除去
+                                    removed_files = [f for f, _ in imgs]
+                                    st.session_state["images_for_review"] = [
+                                        (fn, ib) for fn, ib in low_conf_images
+                                        if fn not in removed_files
+                                    ]
+                                    st.session_state.pop(del_key, None)
+                                    st.success(f"**{name}** を削除しました。")
+                                    st.rerun()
+                            with c2:
+                                if st.button("キャンセル", key=f"cancel_del_{item_idx}"):
+                                    st.session_state.pop(del_key, None)
+                                    st.rerun()
+                        else:
+                            if st.button("このレコードを削除", key=f"del_{item_idx}"):
+                                st.session_state[del_key] = True
+                                st.rerun()
 
                 st.divider()
 
