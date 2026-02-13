@@ -121,9 +121,9 @@ REQUIRED_FIELDS = [
 ]
 
 # アップロード上限枚数
-MAX_FILES = 100
+MAX_FILES = 10
 # プレビューに表示する最大枚数
-PREVIEW_MAX = 12
+PREVIEW_MAX = 10
 # バッチ処理の単位
 BATCH_SIZE = 10
 
@@ -588,19 +588,12 @@ def main():
         results = []
         file_conf_map = {}  # file_name -> confidence_pct
         images_for_review = []  # 信頼値低い写真用に保持
-        progress = st.progress(0, text="準備中...")
-        status_text = st.empty()
-
         total = len(uploaded_files)
+        progress = st.progress(0, text=f"抽出中... 0/{total}件 完了")
+
         for i, uf in enumerate(uploaded_files):
             fname = uf.name
-            batch_num = i // BATCH_SIZE + 1
-            total_batches = (total - 1) // BATCH_SIZE + 1
-            progress.progress(
-                i / total,
-                text=f"抽出中... ({i + 1}/{total}) バッチ {batch_num}/{total_batches}",
-            )
-            status_text.caption(f"処理中: {fname}")
+            progress.progress(i / total, text=f"抽出中... {i}/{total}件 完了")
 
             # ここで初めて画像データを読み込む（遅延読み込み）
             file_bytes = uf.read()
@@ -642,8 +635,7 @@ def main():
             if file_conf_map[fname] < 90:
                 images_for_review.append((fname, image_bytes))
 
-        progress.progress(1.0, text=f"完了！ {len(results)}件を抽出しました。")
-        status_text.empty()
+        progress.progress(1.0, text=f"完了！ {total}/{total}件 抽出しました。")
 
         # 同一人物のレコードを突合
         merged = merge_records(results)
