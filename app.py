@@ -676,7 +676,10 @@ def main():
 
         if review_items:
             st.header(f"⚠ 要確認レコード（{len(review_items)}件）— 画像を見ながら修正")
-            st.caption("左に元の書類画像、右に抽出データを表示しています。修正して「反映」を押すと下の表に反映されます。")
+            st.caption("各レコードを修正・削除選択した後、ページ下部の「すべての修正をまとめて反映」で一括反映されます。")
+
+            # 削除チェック用
+            delete_checks = {}
 
             for item_idx, (data_idx, data, imgs, pct, low_fields) in enumerate(review_items):
                 name = f"{data.get('利用者_姓', '')} {data.get('利用者_名', '')}".strip() or f"レコード{data_idx+1}"
@@ -692,59 +695,61 @@ def main():
                         st.image(img_bytes, caption=fname, use_container_width=True)
 
                 with col_form:
-                    edited_values = {}
                     form_cols = st.columns(3)
                     for fi, col_name in enumerate(CSV_COLUMNS):
                         with form_cols[fi % 3]:
                             is_low = col_name in low_fields
                             current_val = str(data.get(col_name, ""))
                             label_suffix = " ⚠" if is_low else ""
-                            edited_values[col_name] = st.text_input(
+                            st.text_input(
                                 f"{col_name}{label_suffix}",
                                 value=current_val,
                                 key=f"review_{item_idx}_{col_name}",
                             )
 
-                    btn_apply, btn_del = st.columns(2)
-                    with btn_apply:
-                        if st.button("この修正を反映する", key=f"apply_{item_idx}"):
-                            for col_name, val in edited_values.items():
-                                data_list[data_idx][col_name] = val
-                            if "confidence" in data_list[data_idx]:
-                                for col_name in CSV_COLUMNS:
-                                    data_list[data_idx]["confidence"][col_name] = "high"
-                            st.session_state["extracted_data"] = data_list
-                            st.success(f"**{name}** のデータを反映しました。")
-                            st.rerun()
-                    with btn_del:
-                        del_key = f"confirm_del_{item_idx}"
-                        if st.session_state.get(del_key):
-                            # 確認状態: 本当に削除するか聞く
-                            st.error(f"**{name}** のデータを完全に削除しますか？")
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                if st.button("はい、削除する", key=f"do_del_{item_idx}", type="primary"):
-                                    data_list.pop(data_idx)
-                                    st.session_state["extracted_data"] = data_list
-                                    # 削除した画像をレビューリストからも除去
-                                    removed_files = [f for f, _ in imgs]
-                                    st.session_state["images_for_review"] = [
-                                        (fn, ib) for fn, ib in low_conf_images
-                                        if fn not in removed_files
-                                    ]
-                                    st.session_state.pop(del_key, None)
-                                    st.success(f"**{name}** を削除しました。")
-                                    st.rerun()
-                            with c2:
-                                if st.button("キャンセル", key=f"cancel_del_{item_idx}"):
-                                    st.session_state.pop(del_key, None)
-                                    st.rerun()
-                        else:
-                            if st.button("このレコードを削除", key=f"del_{item_idx}"):
-                                st.session_state[del_key] = True
-                                st.rerun()
+                    delete_checks[item_idx] = st.checkbox(
+                        "このレコードを削除する",
+                        key=f"del_check_{item_idx}",
+                    )
 
                 st.divider()
+
+            # 一括反映ボタン
+            if st.button("すべての修正をまとめて反映", type="primary", use_container_width=True):
+                del_indices = set()
+                deleted_files = set()
+
+                for item_idx, (data_idx, data, imgs, pct, low_fields) in enumerate(review_items):
+                    if delete_checks.get(item_idx):
+                        del_indices.add(data_idx)
+                        deleted_files.update(f for f, _ in imgs)
+                    else:
+                        # 修正値を反映
+                        for col_name in CSV_COLUMNS:
+                            val = st.session_state.get(f"review_{item_idx}_{col_name}", "")
+                            data_list[data_idx][col_name] = val
+                        if "confidence" in data_list[data_idx]:
+                            for col_name in CSV_COLUMNS:
+                                data_list[data_idx]["confidence"][col_name] = "high"
+
+                # 削除実行（インデックスが大きい方から消す）
+                if del_indices:
+                    for idx in sorted(del_indices, reverse=True):
+                        data_list.pop(idx)
+                    st.session_state["images_for_review"] = [
+                        (fn, ib) for fn, ib in low_conf_images
+                        if fn not in deleted_files
+                    ]
+
+                st.session_state["extracted_data"] = data_list
+                applied = len(review_items) - len(del_indices)
+                msg_parts = []
+                if applied:
+                    msg_parts.append(f"{applied}件を修正反映")
+                if del_indices:
+                    msg_parts.append(f"{len(del_indices)}件を削除")
+                st.success("・".join(msg_parts) + " しました。")
+                st.rerun()
 
     # ステップ4: 結果確認・編集
     if "extracted_data" in st.session_state:
