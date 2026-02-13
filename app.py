@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -569,9 +570,21 @@ def render_extraction_section(uploaded_files: list):
     all_images = {}
     total = len(uploaded_files)
     progress = st.progress(0, text=f"抽出中... 0/{total}件 完了")
+    start_time = time.time()
 
     for i, uf in enumerate(uploaded_files):
-        progress.progress(i / total, text=f"抽出中... {i}/{total}件 完了")
+        # 残り時間の推定
+        if i > 0:
+            elapsed = time.time() - start_time
+            avg_sec = elapsed / i
+            remaining = avg_sec * (total - i)
+            if remaining >= 60:
+                eta = f"（残り約{int(remaining // 60)}分{int(remaining % 60)}秒）"
+            else:
+                eta = f"（残り約{int(remaining)}秒）"
+        else:
+            eta = ""
+        progress.progress(i / total, text=f"抽出中... {i}/{total}件 完了 {eta}")
 
         extracted, image_bytes = _extract_single_file(uf)
         fname = uf.name
@@ -588,7 +601,12 @@ def render_extraction_section(uploaded_files: list):
 
         all_images[fname] = image_bytes
 
-    progress.progress(1.0, text=f"完了！ {total}/{total}件 抽出しました。")
+    elapsed_total = time.time() - start_time
+    if elapsed_total >= 60:
+        time_str = f"{int(elapsed_total // 60)}分{int(elapsed_total % 60)}秒"
+    else:
+        time_str = f"{int(elapsed_total)}秒"
+    progress.progress(1.0, text=f"完了！ {total}/{total}件を{time_str}で抽出しました。")
 
     merged = merge_records(results)
     st.session_state["extracted_data"] = merged
