@@ -411,8 +411,9 @@ def merge_records(data_list: list[dict]) -> list[dict]:
 
         if key not in groups:
             merged = {col: data.get(col, "") for col in CSV_COLUMNS}
-            # confidence情報もコピー
             merged["confidence"] = dict(data.get("confidence", {}))
+            # ソースファイル名を保持
+            merged["_source_files"] = [data.get("_source_file", "")]
             groups[key] = merged
         else:
             existing = groups[key]
@@ -434,6 +435,10 @@ def merge_records(data_list: list[dict]) -> list[dict]:
                     elif len(new_val) > len(old_val) and new_c == old_c:
                         existing[col] = new_val
             existing["confidence"] = existing_conf
+            # ソースファイル名をマージ
+            src = data.get("_source_file", "")
+            if src and src not in existing.get("_source_files", []):
+                existing.setdefault("_source_files", []).append(src)
 
     return list(groups.values()) + unmatched
 
@@ -649,22 +654,69 @@ def main():
         st.session_state["processing"] = False
         st.rerun()
 
-    # ステップ3.5: 信頼値が低い写真のハイライト表示
-    if "images_for_review" in st.session_state and "file_conf_map" in st.session_state:
+    # ステップ3.5: 要確認レコードの画像付き個別編集
+    if ("images_for_review" in st.session_state
+        and "file_conf_map" in st.session_state
+        and "extracted_data" in st.session_state):
+
         file_conf_map = st.session_state["file_conf_map"]
         low_conf_images = st.session_state["images_for_review"]
-        if low_conf_images:
-            st.header(f"⚠ 読取精度が低い書類（{len(low_conf_images)}件）")
-            st.caption("以下の書類は読み取り信頼度が低いため、抽出結果を重点的に確認してください。")
-            cols = st.columns(min(len(low_conf_images), 3))
-            for i, (fname, img_bytes) in enumerate(low_conf_images):
-                pct = file_conf_map.get(fname, 0)
-                with cols[i % 3]:
-                    st.image(img_bytes, use_container_width=True)
-                    if pct < 60:
-                        st.error(f"📄 {fname}  —  照合率 **{pct}%**")
-                    else:
-                        st.warning(f"📄 {fname}  —  照合率 **{pct}%**")
+        data_list = st.session_state["extracted_data"]
+        # ファイル名→画像のマップ
+        img_map = {fname: img_bytes for fname, img_bytes in low_conf_images}
+
+        # 要確認レコードを抽出（ソースファイルが低信頼度のもの）
+        review_items = []
+        for idx, data in enumerate(data_list):
+            src_files = data.get("_source_files", [data.get("_source_file", "")])
+            matching_imgs = [(f, img_map[f]) for f in src_files if f in img_map]
+            if matching_imgs:
+                pct, label, low_fields = calc_confidence(data)
+                review_items.append((idx, data, matching_imgs, pct, low_fields))
+
+        if review_items:
+            st.header(f"⚠ 要確認レコード（{len(review_items)}件）— 画像を見ながら修正")
+            st.caption("左に元の書類画像、右に抽出データを表示しています。修正して「反映」を押すと下の表に反映されます。")
+
+            for item_idx, (data_idx, data, imgs, pct, low_fields) in enumerate(review_items):
+                name = f"{data.get('利用者_姓', '')} {data.get('利用者_名', '')}".strip() or f"レコード{data_idx+1}"
+                if pct < 60:
+                    st.error(f"**{name}** — 照合率 {pct}%　不明項目: {', '.join(low_fields)}")
+                else:
+                    st.warning(f"**{name}** — 照合率 {pct}%　不明項目: {', '.join(low_fields)}")
+
+                col_img, col_form = st.columns([1, 2])
+
+                with col_img:
+                    for fname, img_bytes in imgs:
+                        st.image(img_bytes, caption=fname, use_container_width=True)
+
+                with col_form:
+                    edited_values = {}
+                    form_cols = st.columns(3)
+                    for fi, col_name in enumerate(CSV_COLUMNS):
+                        with form_cols[fi % 3]:
+                            is_low = col_name in low_fields
+                            current_val = str(data.get(col_name, ""))
+                            label_suffix = " ⚠" if is_low else ""
+                            edited_values[col_name] = st.text_input(
+                                f"{col_name}{label_suffix}",
+                                value=current_val,
+                                key=f"review_{item_idx}_{col_name}",
+                            )
+
+                    if st.button(f"この修正を反映する", key=f"apply_{item_idx}"):
+                        for col_name, val in edited_values.items():
+                            data_list[data_idx][col_name] = val
+                        # confidence情報をhighに更新（人が確認済み）
+                        if "confidence" in data_list[data_idx]:
+                            for col_name in CSV_COLUMNS:
+                                data_list[data_idx]["confidence"][col_name] = "high"
+                        st.session_state["extracted_data"] = data_list
+                        st.success(f"**{name}** のデータを反映しました。")
+                        st.rerun()
+
+                st.divider()
 
     # ステップ4: 結果確認・編集
     if "extracted_data" in st.session_state:
