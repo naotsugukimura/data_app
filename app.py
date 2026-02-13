@@ -473,34 +473,49 @@ def append_to_google_sheet(df: pd.DataFrame, spreadsheet_url: str, sheet_name: s
 # --- Streamlit UI ---
 
 
+_GUARD_ON_JS = """
+<script>
+(function() {
+    // iframe内からtopにアクセス（Streamlit Cloudは同一オリジン）
+    try {
+        var w = window.parent.document ? window.parent : window;
+    } catch(e) {
+        var w = window;
+    }
+    function guard(e) { e.preventDefault(); e.returnValue = '処理中です。本当にページを離れますか？'; return e.returnValue; }
+    w.addEventListener('beforeunload', guard);
+    // グローバルに保持して後で解除できるようにする
+    w.__streamlit_guard = guard;
+})();
+</script>
+"""
+
+_GUARD_OFF_JS = """
+<script>
+(function() {
+    try {
+        var w = window.parent.document ? window.parent : window;
+    } catch(e) {
+        var w = window;
+    }
+    if (w.__streamlit_guard) {
+        w.removeEventListener('beforeunload', w.__streamlit_guard);
+        delete w.__streamlit_guard;
+    }
+    w.onbeforeunload = null;
+})();
+</script>
+"""
+
+
 def inject_beforeunload_guard():
     """処理中にタブを閉じようとしたらブラウザのアラートを出すJS"""
-    st.components.v1.html(
-        """
-        <script>
-        // Streamlitの親windowにイベントを設定
-        const win = window.parent || window;
-        win.addEventListener('beforeunload', function(e) {
-            e.preventDefault();
-            e.returnValue = '';
-        });
-        </script>
-        """,
-        height=0,
-    )
+    st.components.v1.html(_GUARD_ON_JS, height=0)
 
 
 def remove_beforeunload_guard():
     """処理完了後にアラートを解除するJS"""
-    st.components.v1.html(
-        """
-        <script>
-        const win = window.parent || window;
-        win.onbeforeunload = null;
-        </script>
-        """,
-        height=0,
-    )
+    st.components.v1.html(_GUARD_OFF_JS, height=0)
 
 
 def main():
