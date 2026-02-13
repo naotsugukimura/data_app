@@ -120,8 +120,10 @@ REQUIRED_FIELDS = [
     "支給決定終了日 (YYYY年MM月DD日)",
 ]
 
+# アップロード上限枚数
+MAX_FILES = 100
 # プレビューに表示する最大枚数
-PREVIEW_MAX = 20
+PREVIEW_MAX = 12
 # バッチ処理の単位
 BATCH_SIZE = 10
 
@@ -522,7 +524,7 @@ def main():
 
     # ステップ1: ファイルアップロード（複数対応・ドラッグ&ドロップ対応）
     st.header("① 書類をアップロード")
-    st.caption("ファイルをドラッグ&ドロップ、またはクリックして選択（最大300枚まで）")
+    st.caption(f"ファイルをドラッグ&ドロップ、またはクリックして選択（最大{MAX_FILES}枚まで）")
     uploaded_files = st.file_uploader(
         "受給者証・契約書の画像またはPDFをアップロード",
         type=["jpg", "jpeg", "png", "pdf"],
@@ -534,47 +536,29 @@ def main():
         st.info("ファイルをドラッグ&ドロップ、またはクリックしてアップロードしてください。")
         return
 
-    # 各ファイルの画像データを準備
-    images = []  # [(file_name, image_bytes, media_type), ...]
-    for uf in uploaded_files:
-        file_bytes = uf.read()
-        file_name = uf.name
-        is_pdf = file_name.lower().endswith(".pdf")
-
-        if is_pdf:
-            image_bytes = convert_pdf_to_image(file_bytes)
-            if image_bytes is None:
-                st.error(f"PDFの画像変換に失敗: {file_name}")
-                continue
-            media_type = "image/png"
-        else:
-            image_bytes = file_bytes
-            ext = file_name.lower().rsplit(".", 1)[-1]
-            media_type = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
-        images.append((file_name, image_bytes, media_type))
-
-    if not images:
+    if len(uploaded_files) > MAX_FILES:
+        st.error(f"アップロードは{MAX_FILES}枚までです。現在{len(uploaded_files)}枚選択されています。")
         return
 
-    st.success(f"{len(images)}件のファイルを読み込みました。")
+    # アップロード直後はファイル名一覧のみ表示（画像データは読み込まない）
+    file_names = [uf.name for uf in uploaded_files]
+    st.success(f"{len(file_names)}件のファイルを検出しました。")
 
-    # ステップ2: 画像プレビュー（大量の場合は折りたたみ）
-    st.header(f"② 画像プレビュー（{len(images)}件）")
-    if len(images) <= PREVIEW_MAX:
-        cols = st.columns(min(len(images), 3))
-        for i, (fname, img_bytes, _) in enumerate(images):
+    # ステップ2: ファイル一覧（プレビューは折りたたみ内で遅延表示）
+    st.header(f"② アップロードファイル一覧（{len(file_names)}件）")
+    with st.expander("ファイル名一覧", expanded=False):
+        for i, name in enumerate(file_names):
+            st.text(f"{i+1}. {name}")
+
+    with st.expander(f"画像プレビュー（先頭{PREVIEW_MAX}件）", expanded=False):
+        preview_count = min(len(uploaded_files), PREVIEW_MAX)
+        cols = st.columns(3)
+        for i in range(preview_count):
+            uf = uploaded_files[i]
             with cols[i % 3]:
-                st.image(img_bytes, caption=fname, use_container_width=True)
-    else:
-        st.info(f"{len(images)}件のファイルがあります。先頭{PREVIEW_MAX}件をプレビュー表示します。")
-        with st.expander(f"先頭{PREVIEW_MAX}件のプレビュー", expanded=False):
-            cols = st.columns(3)
-            for i in range(PREVIEW_MAX):
-                fname, img_bytes, _ = images[i]
-                with cols[i % 3]:
-                    st.image(img_bytes, caption=fname, use_container_width=True)
+                st.image(uf, caption=uf.name, use_container_width=True)
 
-    # ステップ3: AI抽出（バッチ処理）
+    # ステップ3: AI抽出（ボタン押下時に画像を読み込み・処理）
     st.header("③ AIによるデータ抽出")
 
     if st.button("すべてのデータを抽出する", type="primary", use_container_width=True):
@@ -582,21 +566,40 @@ def main():
         inject_beforeunload_guard()
 
         results = []
-        # ファイル名→インデックスの対応を保持（③で信頼度低い写真を特定するため）
         file_conf_map = {}  # file_name -> confidence_pct
-        progress = st.progress(0, text="抽出中...")
+        images_for_review = []  # 信頼値低い写真用に保持
+        progress = st.progress(0, text="準備中...")
         status_text = st.empty()
 
-        for i, (fname, img_bytes, mtype) in enumerate(images):
+        total = len(uploaded_files)
+        for i, uf in enumerate(uploaded_files):
+            fname = uf.name
             batch_num = i // BATCH_SIZE + 1
-            total_batches = (len(images) - 1) // BATCH_SIZE + 1
+            total_batches = (total - 1) // BATCH_SIZE + 1
             progress.progress(
-                i / len(images),
-                text=f"抽出中... ({i + 1}/{len(images)}) バッチ {batch_num}/{total_batches}",
+                i / total,
+                text=f"抽出中... ({i + 1}/{total}) バッチ {batch_num}/{total_batches}",
             )
             status_text.caption(f"処理中: {fname}")
 
-            compressed, comp_mtype = compress_image(img_bytes, mtype)
+            # ここで初めて画像データを読み込む（遅延読み込み）
+            file_bytes = uf.read()
+            is_pdf = fname.lower().endswith(".pdf")
+
+            if is_pdf:
+                image_bytes = convert_pdf_to_image(file_bytes)
+                if image_bytes is None:
+                    st.warning(f"PDF変換失敗: {fname}")
+                    file_conf_map[fname] = 0
+                    results.append({col: "" for col in CSV_COLUMNS})
+                    continue
+                mtype = "image/png"
+            else:
+                image_bytes = file_bytes
+                ext = fname.lower().rsplit(".", 1)[-1]
+                mtype = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+
+            compressed, comp_mtype = compress_image(image_bytes, mtype)
             image_base64 = encode_image_to_base64(compressed)
             if api_provider == "Anthropic (Claude)":
                 extracted = extract_with_anthropic(image_base64, comp_mtype)
@@ -604,7 +607,6 @@ def main():
                 extracted = extract_with_openai(image_base64, comp_mtype)
 
             if extracted is not None:
-                # 元ファイル名を紐付け
                 extracted["_source_file"] = fname
                 results.append(extracted)
                 pct, _, _ = calc_confidence(extracted)
@@ -616,6 +618,10 @@ def main():
                 results.append(empty)
                 file_conf_map[fname] = 0
 
+            # 信頼値が低い写真は後で表示するために保持
+            if file_conf_map[fname] < 90:
+                images_for_review.append((fname, image_bytes))
+
         progress.progress(1.0, text=f"完了！ {len(results)}件を抽出しました。")
         status_text.empty()
 
@@ -624,19 +630,14 @@ def main():
         st.session_state["extracted_data"] = merged
         st.session_state["raw_count"] = len(results)
         st.session_state["file_conf_map"] = file_conf_map
-        st.session_state["images"] = images
+        st.session_state["images_for_review"] = images_for_review
         st.session_state["processing"] = False
         st.rerun()
 
     # ステップ3.5: 信頼値が低い写真のハイライト表示
-    if "file_conf_map" in st.session_state and "images" in st.session_state:
+    if "images_for_review" in st.session_state and "file_conf_map" in st.session_state:
         file_conf_map = st.session_state["file_conf_map"]
-        stored_images = st.session_state["images"]
-        low_conf_images = [
-            (fname, img_bytes)
-            for fname, img_bytes, _ in stored_images
-            if file_conf_map.get(fname, 100) < 90
-        ]
+        low_conf_images = st.session_state["images_for_review"]
         if low_conf_images:
             st.header(f"⚠ 読取精度が低い書類（{len(low_conf_images)}件）")
             st.caption("以下の書類は読み取り信頼度が低いため、抽出結果を重点的に確認してください。")
