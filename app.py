@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -68,7 +69,7 @@ EXTRACTION_PROMPT = """あなたは障害福祉サービスの書類読み取り
 10. 支給決定終了日 (YYYY年MM月DD日) 例: 2025年03月31日
 11. モニタリング_月数
 12. モニタリング_終了月
-13. 郵便番号 (例: 123-4567)
+13. 郵便番号 (ハイフンなし7桁の数字のみ 例: 1234567)
 14. 都道府県
 15. 住所 (都道府県より後の部分)
 
@@ -118,6 +119,11 @@ REQUIRED_FIELDS = [
     "支給決定開始日 (YYYY年MM月DD日)",
     "支給決定終了日 (YYYY年MM月DD日)",
 ]
+
+# プレビューに表示する最大枚数
+PREVIEW_MAX = 20
+# バッチ処理の単位
+BATCH_SIZE = 10
 
 
 # --- ユーティリティ関数 ---
@@ -184,6 +190,12 @@ def convert_pdf_to_image(pdf_bytes: bytes) -> Optional[bytes]:
     return None
 
 
+def strip_postal_hyphen(val: str) -> str:
+    """郵便番号からハイフンを除去して数字7桁のみにする"""
+    digits = re.sub(r"[^\d]", "", val)
+    return digits
+
+
 def extract_with_anthropic(image_base64: str, media_type: str) -> Optional[dict]:
     """Anthropic Claude Vision APIで画像からデータを抽出"""
     try:
@@ -219,7 +231,13 @@ def extract_with_anthropic(image_base64: str, media_type: str) -> Optional[dict]
             ],
         )
         response_text = message.content[0].text
-        return parse_json_response(response_text)
+        result = parse_json_response(response_text)
+        if result:
+            # 郵便番号のハイフン除去を後処理でも保証
+            postal = str(result.get("郵便番号", ""))
+            if postal:
+                result["郵便番号"] = strip_postal_hyphen(postal)
+        return result
     except Exception as e:
         st.error(f"Anthropic API エラー: {e}")
         return None
@@ -258,7 +276,12 @@ def extract_with_openai(image_base64: str, media_type: str) -> Optional[dict]:
             ],
         )
         response_text = response.choices[0].message.content
-        return parse_json_response(response_text)
+        result = parse_json_response(response_text)
+        if result:
+            postal = str(result.get("郵便番号", ""))
+            if postal:
+                result["郵便番号"] = strip_postal_hyphen(postal)
+        return result
     except Exception as e:
         st.error(f"OpenAI API エラー: {e}")
         return None
@@ -448,6 +471,36 @@ def append_to_google_sheet(df: pd.DataFrame, spreadsheet_url: str, sheet_name: s
 # --- Streamlit UI ---
 
 
+def inject_beforeunload_guard():
+    """処理中にタブを閉じようとしたらブラウザのアラートを出すJS"""
+    st.components.v1.html(
+        """
+        <script>
+        // Streamlitの親windowにイベントを設定
+        const win = window.parent || window;
+        win.addEventListener('beforeunload', function(e) {
+            e.preventDefault();
+            e.returnValue = '';
+        });
+        </script>
+        """,
+        height=0,
+    )
+
+
+def remove_beforeunload_guard():
+    """処理完了後にアラートを解除するJS"""
+    st.components.v1.html(
+        """
+        <script>
+        const win = window.parent || window;
+        win.onbeforeunload = null;
+        </script>
+        """,
+        height=0,
+    )
+
+
 def main():
     st.set_page_config(
         page_title="利用者情報 自動抽出ツール",
@@ -461,19 +514,24 @@ def main():
     # API選択（固定: Anthropic）
     api_provider = "Anthropic (Claude)"
 
+    # 処理中フラグがあればタブ閉じアラートを有効化
+    if st.session_state.get("processing"):
+        inject_beforeunload_guard()
+
     # --- メインエリア ---
 
-    # ステップ1: ファイルアップロード（複数対応）
+    # ステップ1: ファイルアップロード（複数対応・ドラッグ&ドロップ対応）
     st.header("① 書類をアップロード")
+    st.caption("ファイルをドラッグ&ドロップ、またはクリックして選択（最大300枚まで）")
     uploaded_files = st.file_uploader(
-        "受給者証・契約書の画像またはPDFをアップロードしてください",
+        "受給者証・契約書の画像またはPDFをアップロード",
         type=["jpg", "jpeg", "png", "pdf"],
         accept_multiple_files=True,
-        help="対応形式: JPG, PNG, PDF (PDFは1ページ目のみ処理) — 複数ファイル選択可",
+        label_visibility="collapsed",
     )
 
     if not uploaded_files:
-        st.info("ファイルをアップロードすると処理が開始できます。")
+        st.info("ファイルをドラッグ&ドロップ、またはクリックしてアップロードしてください。")
         return
 
     # 各ファイルの画像データを準備
@@ -498,24 +556,46 @@ def main():
     if not images:
         return
 
-    # ステップ2: 画像プレビュー
-    st.header(f"② 画像プレビュー（{len(images)}件）")
-    cols = st.columns(min(len(images), 3))
-    for i, (fname, img_bytes, _) in enumerate(images):
-        with cols[i % 3]:
-            st.image(img_bytes, caption=fname, use_container_width=True)
+    st.success(f"{len(images)}件のファイルを読み込みました。")
 
-    # ステップ3: AI抽出（一括）
+    # ステップ2: 画像プレビュー（大量の場合は折りたたみ）
+    st.header(f"② 画像プレビュー（{len(images)}件）")
+    if len(images) <= PREVIEW_MAX:
+        cols = st.columns(min(len(images), 3))
+        for i, (fname, img_bytes, _) in enumerate(images):
+            with cols[i % 3]:
+                st.image(img_bytes, caption=fname, use_container_width=True)
+    else:
+        st.info(f"{len(images)}件のファイルがあります。先頭{PREVIEW_MAX}件をプレビュー表示します。")
+        with st.expander(f"先頭{PREVIEW_MAX}件のプレビュー", expanded=False):
+            cols = st.columns(3)
+            for i in range(PREVIEW_MAX):
+                fname, img_bytes, _ = images[i]
+                with cols[i % 3]:
+                    st.image(img_bytes, caption=fname, use_container_width=True)
+
+    # ステップ3: AI抽出（バッチ処理）
     st.header("③ AIによるデータ抽出")
 
     if st.button("すべてのデータを抽出する", type="primary", use_container_width=True):
+        st.session_state["processing"] = True
+        inject_beforeunload_guard()
+
         results = []
+        # ファイル名→インデックスの対応を保持（③で信頼度低い写真を特定するため）
+        file_conf_map = {}  # file_name -> confidence_pct
         progress = st.progress(0, text="抽出中...")
+        status_text = st.empty()
+
         for i, (fname, img_bytes, mtype) in enumerate(images):
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (len(images) - 1) // BATCH_SIZE + 1
             progress.progress(
                 i / len(images),
-                text=f"抽出中... ({i + 1}/{len(images)}) {fname}",
+                text=f"抽出中... ({i + 1}/{len(images)}) バッチ {batch_num}/{total_batches}",
             )
+            status_text.caption(f"処理中: {fname}")
+
             compressed, comp_mtype = compress_image(img_bytes, mtype)
             image_base64 = encode_image_to_base64(compressed)
             if api_provider == "Anthropic (Claude)":
@@ -524,18 +604,51 @@ def main():
                 extracted = extract_with_openai(image_base64, comp_mtype)
 
             if extracted is not None:
+                # 元ファイル名を紐付け
+                extracted["_source_file"] = fname
                 results.append(extracted)
+                pct, _, _ = calc_confidence(extracted)
+                file_conf_map[fname] = pct
             else:
                 st.warning(f"抽出失敗: {fname}")
-                # 空行を追加して件数を維持
-                results.append({col: "" for col in CSV_COLUMNS})
+                empty = {col: "" for col in CSV_COLUMNS}
+                empty["_source_file"] = fname
+                results.append(empty)
+                file_conf_map[fname] = 0
 
         progress.progress(1.0, text=f"完了！ {len(results)}件を抽出しました。")
+        status_text.empty()
+
         # 同一人物のレコードを突合
         merged = merge_records(results)
         st.session_state["extracted_data"] = merged
         st.session_state["raw_count"] = len(results)
+        st.session_state["file_conf_map"] = file_conf_map
+        st.session_state["images"] = images
+        st.session_state["processing"] = False
         st.rerun()
+
+    # ステップ3.5: 信頼値が低い写真のハイライト表示
+    if "file_conf_map" in st.session_state and "images" in st.session_state:
+        file_conf_map = st.session_state["file_conf_map"]
+        stored_images = st.session_state["images"]
+        low_conf_images = [
+            (fname, img_bytes)
+            for fname, img_bytes, _ in stored_images
+            if file_conf_map.get(fname, 100) < 90
+        ]
+        if low_conf_images:
+            st.header(f"⚠ 読取精度が低い書類（{len(low_conf_images)}件）")
+            st.caption("以下の書類は読み取り信頼度が低いため、抽出結果を重点的に確認してください。")
+            cols = st.columns(min(len(low_conf_images), 3))
+            for i, (fname, img_bytes) in enumerate(low_conf_images):
+                pct = file_conf_map.get(fname, 0)
+                with cols[i % 3]:
+                    st.image(img_bytes, use_container_width=True)
+                    if pct < 60:
+                        st.error(f"📄 {fname}  —  照合率 **{pct}%**")
+                    else:
+                        st.warning(f"📄 {fname}  —  照合率 **{pct}%**")
 
     # ステップ4: 結果確認・編集
     if "extracted_data" in st.session_state:
@@ -640,6 +753,9 @@ def main():
                 st.error(str(e))
             except Exception as e:
                 st.error(f"スプレッドシート書き込みエラー: {e}")
+
+        # 処理完了後のアラート解除
+        remove_beforeunload_guard()
 
 
 if __name__ == "__main__":
