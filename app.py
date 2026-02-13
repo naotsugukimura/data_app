@@ -775,17 +775,33 @@ def _get_record_name(data: dict, data_idx: int) -> str:
     return name or f"レコード{data_idx + 1}"
 
 
+def _field_status(col_name: str, value: str, low_fields: list[str]) -> tuple[str, str]:
+    """フィールドの入力ステータスを判定
+
+    Returns: (status_icon, help_text)
+        🤖 = AIが自信ありで入力  ⚠️ = AI入力だが不鮮明  ✏️ = 未入力（手入力必要）
+    """
+    val = value.strip()
+    if not val:
+        is_required = col_name in REQUIRED_FIELDS
+        req_label = "（必須）" if is_required else "（任意）"
+        return "✏️", f"未入力{req_label} — 手入力してください"
+    elif col_name in low_fields:
+        return "⚠️", "AI読取だが不鮮明 — 確認・修正してください"
+    else:
+        return "🤖", "AI読取（自信あり）"
+
+
 def _render_review_card(
     item_idx: int, data_idx: int, data: dict,
     imgs: list, pct: int, low_fields: list[str],
     delete_checks: dict,
 ):
-    """レビューカード1件を描画"""
+    """レビューカード1件を描画（Human In The Loop対応）"""
     name = _get_record_name(data, data_idx)
     source_types = data.get("_source_types", [])
 
     if len(imgs) > 1:
-        # 書類種別名を使って突合ラベルを生成（例: 「受給者証＋利用契約書 を突合」）
         type_names = [t for t in source_types if t != "不明"] if source_types else []
         if type_names:
             merged_label = f"（{'＋'.join(type_names)} を突合）"
@@ -794,6 +810,7 @@ def _render_review_card(
     else:
         merged_label = ""
 
+    # ── ヘッダー ──
     if pct < 60:
         st.error(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
     elif pct < 90:
@@ -801,11 +818,21 @@ def _render_review_card(
     else:
         st.success(f"**{name}** — 照合率 {pct}%{merged_label}")
 
+    # ── フィールドサマリー（凡例＋概況） ──
+    n_ai = sum(1 for c in CSV_COLUMNS if str(data.get(c, "")).strip() and c not in low_fields)
+    n_warn = sum(1 for c in CSV_COLUMNS if str(data.get(c, "")).strip() and c in low_fields)
+    n_empty = sum(1 for c in CSV_COLUMNS if not str(data.get(c, "")).strip())
+    st.caption(
+        f"🤖 AI入力（自信あり）: {n_ai}件　|　"
+        f"⚠️ AI入力（要確認）: {n_warn}件　|　"
+        f"✏️ 未入力（手入力）: {n_empty}件"
+    )
+
     col_img, col_form = st.columns([1, 2])
 
+    # ── 画像表示 ──
     with col_img:
         if len(imgs) > 1:
-            # タブ名に書類種別を表示（例: 「受給者証 (IMG_001.jpg)」）
             tab_labels = []
             for i, (fname, _img_bytes) in enumerate(imgs):
                 doc_type = source_types[i] if i < len(source_types) else f"書類{i + 1}"
@@ -817,22 +844,33 @@ def _render_review_card(
         else:
             st.image(imgs[0][1], caption=imgs[0][0], use_container_width=True)
 
+    # ── フォーム（フィールドごとにステータス表示） ──
     with col_form:
         form_cols = st.columns(3)
         for fi, col_name in enumerate(CSV_COLUMNS):
             with form_cols[fi % 3]:
-                is_low = col_name in low_fields
-                label_suffix = " ⚠" if is_low else ""
+                val = str(data.get(col_name, ""))
+                icon, help_text = _field_status(col_name, val, low_fields)
                 st.text_input(
-                    f"{col_name}{label_suffix}",
-                    value=str(data.get(col_name, "")),
+                    f"{icon} {col_name}",
+                    value=val,
                     key=f"review_{item_idx}_{col_name}",
+                    help=help_text,
                 )
 
-        delete_checks[item_idx] = st.checkbox(
-            "このレコードを削除する",
-            key=f"del_check_{item_idx}",
-        )
+        # ── 確認済み / 削除 ──
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            st.checkbox(
+                "✅ 内容を確認しました",
+                key=f"confirmed_{item_idx}",
+                value=data.get("_confirmed", False),
+            )
+        with action_cols[1]:
+            delete_checks[item_idx] = st.checkbox(
+                "🗑️ このレコードを削除する",
+                key=f"del_check_{item_idx}",
+            )
 
     st.divider()
 
@@ -841,6 +879,7 @@ def _apply_review_changes(review_items: list, delete_checks: dict, data_list: li
     """レビュー結果を data_list に反映し、削除レコードを除去する"""
     del_indices = set()
     deleted_files = set()
+    confirmed_count = 0
 
     for item_idx, (data_idx, _data, imgs, _pct, _lf) in enumerate(review_items):
         if delete_checks.get(item_idx):
@@ -853,6 +892,11 @@ def _apply_review_changes(review_items: list, delete_checks: dict, data_list: li
             if "confidence" in data_list[data_idx]:
                 for col_name in CSV_COLUMNS:
                     data_list[data_idx]["confidence"][col_name] = "high"
+            # 確認済みフラグを保存
+            is_confirmed = st.session_state.get(f"confirmed_{item_idx}", False)
+            data_list[data_idx]["_confirmed"] = is_confirmed
+            if is_confirmed:
+                confirmed_count += 1
 
     if del_indices:
         for idx in sorted(del_indices, reverse=True):
@@ -865,7 +909,7 @@ def _apply_review_changes(review_items: list, delete_checks: dict, data_list: li
     applied = len(review_items) - len(del_indices)
     msg_parts = []
     if applied:
-        msg_parts.append(f"{applied}件を修正反映")
+        msg_parts.append(f"{applied}件を修正反映（うち{confirmed_count}件が確認済み）")
     if del_indices:
         msg_parts.append(f"{len(del_indices)}件を削除")
     st.success("・".join(msg_parts) + " しました。")
@@ -873,7 +917,7 @@ def _apply_review_changes(review_items: list, delete_checks: dict, data_list: li
 
 
 def render_review_section():
-    """画像付きレコード確認・編集UI"""
+    """画像付きレコード確認・編集UI（Human In The Loop）"""
     if "all_images" not in st.session_state or "extracted_data" not in st.session_state:
         return
 
@@ -898,17 +942,38 @@ def render_review_section():
                 for ii, (di, d, im, p, lf) in enumerate(review_items)
                 if not is_record_ok(p, lf)]
 
-    st.header("画像付きレコード確認")
+    # ── セクションヘッダー（「下書き」であることを明示） ──
+    st.header("📝 AIの下書き — 確認・修正")
+    st.info(
+        "以下はAIが画像から自動読み取りした**下書き**です。\n\n"
+        "各項目のアイコンで入力元を確認し、必要に応じて修正してください。\n"
+        "- 🤖 **AI入力（自信あり）** — 読み取り精度が高い項目。念のため目視確認を推奨\n"
+        "- ⚠️ **AI入力（要確認）** — 不鮮明・推測を含む項目。**必ず確認してください**\n"
+        "- ✏️ **未入力** — 書類から読み取れなかった項目。**手入力が必要です**\n\n"
+        "確認が終わったら「✅ 内容を確認しました」にチェックを入れてください。"
+    )
+
+    # ── 確認済みカウント ──
+    confirmed_count = sum(
+        1 for ii, *_ in (items_ok + items_ng)
+        if st.session_state.get(f"confirmed_{ii}", False)
+    )
+    total_count = len(review_items)
+    st.progress(
+        confirmed_count / total_count if total_count else 0,
+        text=f"確認済み: {confirmed_count}/{total_count}件",
+    )
+
     tab_ng, tab_ok = st.tabs([
-        f"要確認（{len(items_ng)}件）",
-        f"OK（{len(items_ok)}件）",
+        f"⚠️ 要確認（{len(items_ng)}件）",
+        f"✅ OK（{len(items_ok)}件）",
     ])
 
     delete_checks: dict[int, bool] = {}
 
     with tab_ng:
         if items_ng:
-            st.caption("修正・削除選択した後、下部の「すべての修正をまとめて反映」で一括反映されます。")
+            st.caption("⚠️ 要確認項目があるレコードです。修正・削除後、下部のボタンで一括反映されます。")
             for item_idx, data_idx, data, imgs, pct, low_fields in items_ng:
                 _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, delete_checks)
         else:
@@ -916,7 +981,7 @@ def render_review_section():
 
     with tab_ok:
         if items_ok:
-            st.caption("照合率が高いレコードです。内容に問題がなければそのままでOKです。")
+            st.caption("🤖 AI読取の精度が高いレコードです。内容を目視確認して「✅ 内容を確認しました」にチェックしてください。")
             for item_idx, data_idx, data, imgs, pct, low_fields in items_ok:
                 _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, delete_checks)
         else:
@@ -943,18 +1008,31 @@ def render_results_section():
     ok_count = sum(1 for c in conf_info if c["label"] == "OK")
     review_count = len(conf_info) - ok_count
 
+    # 確認済みカウント
+    total_confirmed = sum(1 for d in data_list if d.get("_confirmed", False))
+    total_unconfirmed = len(data_list) - total_confirmed
+
     # ヘッダー
     if raw_count != len(data_list):
         st.header(f"④ 抽出結果の確認・編集（{raw_count}件 → 突合後 {len(data_list)}件）")
     else:
         st.header(f"④ 抽出結果の確認・編集（{len(data_list)}件）")
 
+    # 未確認レコード警告
+    if total_unconfirmed > 0:
+        st.warning(
+            f"⚠️ **{total_unconfirmed}件が未確認**です。"
+            "上の「📝 AIの下書き」セクションで内容を確認し、"
+            "「✅ 内容を確認しました」にチェックしてから出力してください。"
+        )
+
     # サマリー
-    col1, col2, col3 = st.columns(3)
-    col1.metric("OK (確認不要)", f"{ok_count}件")
-    col2.metric("要確認", f"{review_count}件")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("✅ 確認済み", f"{total_confirmed}件")
+    col2.metric("⚠️ 未確認", f"{total_unconfirmed}件")
     avg_pct = sum(c["pct"] for c in conf_info) // len(conf_info) if conf_info else 0
     col3.metric("平均照合率", f"{avg_pct}%")
+    col4.metric("合計", f"{len(data_list)}件")
 
     # フィルタ
     view_filter = st.radio("表示フィルタ", ["すべて", "要確認のみ", "OKのみ"], horizontal=True)
@@ -994,8 +1072,12 @@ def render_results_section():
 
     # ⑤ CSVダウンロード
     st.header("⑤ CSVダウンロード")
+
+    if total_unconfirmed > 0:
+        st.caption(f"⚠️ {total_unconfirmed}件が未確認のままです。出力後も内容の最終確認をお勧めします。")
+
     st.download_button(
-        label=f"CSVファイルをダウンロード（{len(export_df)}件）",
+        label=f"CSVファイルをダウンロード（{len(export_df)}件 / うち確認済み{total_confirmed}件）",
         data=to_csv_bytes(export_df),
         file_name="利用者情報.csv",
         mime="text/csv",
