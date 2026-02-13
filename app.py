@@ -155,6 +155,12 @@ EXTRACTION_PROMPT = """あなたは障害福祉サービスの書類読み取り
 
 MAX_FILES = 10
 MAX_IMAGE_BYTES = 4_500_000  # base64変換後に5MB以内に収まるよう余裕を持たせる
+# OCR用の最適画像設定（解像度を下げすぎると読み取り精度が落ちる）
+OCR_MAX_DIMENSION = 1600  # OCRに十分な最大辺ピクセル数
+OCR_JPEG_QUALITY = 80     # JPEG圧縮品質（OCRには80で十分）
+# プレビュー/レビュー用サムネイル設定
+PREVIEW_MAX_DIMENSION = 800   # プレビュー表示用（これで十分）
+PREVIEW_JPEG_QUALITY = 60     # プレビュー品質
 
 # =============================================================================
 # シークレット取得
@@ -175,30 +181,57 @@ def get_secret(key: str) -> str:
 
 
 def compress_image(image_bytes: bytes, media_type: str) -> tuple[bytes, str]:
-    """画像がAPIの上限を超える場合にリサイズ・圧縮する"""
-    from PIL import Image
+    """画像をOCR最適サイズに常時圧縮する（API速度＋精度のバランス）
 
-    if len(image_bytes) <= MAX_IMAGE_BYTES:
-        return image_bytes, media_type
+    受給者証・契約書のOCRでは1600px・JPEG 80で十分な精度が得られる。
+    元画像が小さい場合は拡大せずそのまま圧縮のみ行う。
+    """
+    from PIL import Image
 
     img = Image.open(io.BytesIO(image_bytes))
 
-    for quality in (85, 70, 50, 35):
-        max_dim = 2048 if quality >= 70 else 1600
-        if max(img.size) > max_dim:
-            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+    # OCR最適解像度にリサイズ（元画像が小さければ拡大しない）
+    if max(img.size) > OCR_MAX_DIMENSION:
+        img.thumbnail((OCR_MAX_DIMENSION, OCR_MAX_DIMENSION), Image.LANCZOS)
 
+    rgb_img = img.convert("RGB") if img.mode != "RGB" else img
+
+    # まずOCR品質で圧縮
+    buf = io.BytesIO()
+    rgb_img.save(buf, format="JPEG", quality=OCR_JPEG_QUALITY)
+    result = buf.getvalue()
+    if len(result) <= MAX_IMAGE_BYTES:
+        return result, "image/jpeg"
+
+    # API上限を超える場合は段階的に品質を下げる
+    for quality in (60, 45, 30):
         buf = io.BytesIO()
-        rgb_img = img.convert("RGB") if img.mode != "RGB" else img
         rgb_img.save(buf, format="JPEG", quality=quality)
         result = buf.getvalue()
         if len(result) <= MAX_IMAGE_BYTES:
             return result, "image/jpeg"
 
+    # それでも超える場合はさらに縮小
     img.thumbnail((1200, 1200), Image.LANCZOS)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=30)
     return buf.getvalue(), "image/jpeg"
+
+
+def make_thumbnail(image_bytes: bytes) -> bytes:
+    """レビュー画面用のサムネイルを生成（元画像より大幅に軽量化）"""
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if max(img.size) > PREVIEW_MAX_DIMENSION:
+            img.thumbnail((PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION), Image.LANCZOS)
+        rgb_img = img.convert("RGB") if img.mode != "RGB" else img
+        buf = io.BytesIO()
+        rgb_img.save(buf, format="JPEG", quality=PREVIEW_JPEG_QUALITY)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes  # 変換失敗時は元画像をそのまま返す
 
 
 def convert_pdf_to_image(pdf_bytes: bytes) -> Optional[bytes]:
@@ -631,8 +664,9 @@ def render_file_list(uploaded_files: list):
 def _prepare_file(uf) -> tuple[str, bytes, Optional[str], Optional[str]]:
     """ファイルを読み込み・圧縮してAPI呼び出し用データを準備する（メインスレッドで実行）
 
-    Returns: (fname, image_bytes, image_base64, media_type)
+    Returns: (fname, thumbnail_bytes, image_base64, media_type)
         image_base64がNoneの場合は準備失敗
+        thumbnail_bytesはレビュー表示用の軽量画像
     """
     file_bytes = uf.read()
     fname = uf.name
@@ -647,9 +681,12 @@ def _prepare_file(uf) -> tuple[str, bytes, Optional[str], Optional[str]]:
         image_bytes = file_bytes
         mtype = get_media_type(fname)
 
+    # OCR用に圧縮（API送信用）
     compressed, comp_mtype = compress_image(image_bytes, mtype)
     image_base64 = base64.b64encode(compressed).decode("utf-8")
-    return fname, image_bytes, image_base64, comp_mtype
+    # レビュー表示用のサムネイル生成（さらに軽量）
+    thumbnail = make_thumbnail(image_bytes)
+    return fname, thumbnail, image_base64, comp_mtype
 
 
 def _call_api(fname: str, image_base64: str, media_type: str) -> tuple[str, Optional[dict]]:
