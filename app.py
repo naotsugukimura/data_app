@@ -587,7 +587,7 @@ def main():
 
         results = []
         file_conf_map = {}  # file_name -> confidence_pct
-        images_for_review = []  # 信頼値低い写真用に保持
+        all_images = {}  # 全ファイルの画像を保持（マージ時の参照用）
         total = len(uploaded_files)
         progress = st.progress(0, text=f"抽出中... 0/{total}件 完了")
 
@@ -631,9 +631,8 @@ def main():
                 results.append(empty)
                 file_conf_map[fname] = 0
 
-            # 信頼値が低い写真は後で表示するために保持
-            if file_conf_map[fname] < 90:
-                images_for_review.append((fname, image_bytes))
+            # 全画像を保持（マージレコードでも全ソース画像を表示するため）
+            all_images[fname] = image_bytes
 
         progress.progress(1.0, text=f"完了！ {total}/{total}件 抽出しました。")
 
@@ -642,22 +641,18 @@ def main():
         st.session_state["extracted_data"] = merged
         st.session_state["raw_count"] = len(results)
         st.session_state["file_conf_map"] = file_conf_map
-        st.session_state["images_for_review"] = images_for_review
+        st.session_state["all_images"] = all_images
         st.session_state["processing"] = False
         st.rerun()
 
-    # ステップ3.5: 要確認レコードの画像付き個別編集
-    if ("images_for_review" in st.session_state
-        and "file_conf_map" in st.session_state
+    # ステップ3.5: 画像付きレコード確認・編集
+    if ("all_images" in st.session_state
         and "extracted_data" in st.session_state):
 
-        file_conf_map = st.session_state["file_conf_map"]
-        low_conf_images = st.session_state["images_for_review"]
+        img_map = st.session_state["all_images"]
         data_list = st.session_state["extracted_data"]
-        # ファイル名→画像のマップ
-        img_map = {fname: img_bytes for fname, img_bytes in low_conf_images}
 
-        # 要確認レコードを抽出（ソースファイルが低信頼度のもの）
+        # 全レコードのうちソース画像があるものを確認対象にする
         review_items = []
         for idx, data in enumerate(data_list):
             src_files = data.get("_source_files", [data.get("_source_file", "")])
@@ -687,17 +682,24 @@ def main():
             def _render_review_card(item_idx, data_idx, data, imgs, pct, low_fields, prefix):
                 """レビューカード1件を描画"""
                 name = f"{data.get('利用者_姓', '')} {data.get('利用者_名', '')}".strip() or f"レコード{data_idx+1}"
+                merged_label = f"（書類{len(imgs)}枚を突合）" if len(imgs) > 1 else ""
                 if pct < 60:
-                    st.error(f"**{name}** — 照合率 {pct}%　不明項目: {', '.join(low_fields)}")
+                    st.error(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
                 elif pct < 90:
-                    st.warning(f"**{name}** — 照合率 {pct}%　不明項目: {', '.join(low_fields)}")
+                    st.warning(f"**{name}** — 照合率 {pct}%{merged_label}　不明項目: {', '.join(low_fields)}")
                 else:
-                    st.success(f"**{name}** — 照合率 {pct}%")
+                    st.success(f"**{name}** — 照合率 {pct}%{merged_label}")
 
                 col_img, col_form = st.columns([1, 2])
 
                 with col_img:
-                    for fname, img_bytes in imgs:
+                    if len(imgs) > 1:
+                        img_tabs = st.tabs([f"書類{i+1}" for i in range(len(imgs))])
+                        for i, (fname, img_bytes) in enumerate(imgs):
+                            with img_tabs[i]:
+                                st.image(img_bytes, caption=fname, use_container_width=True)
+                    else:
+                        fname, img_bytes = imgs[0]
                         st.image(img_bytes, caption=fname, use_container_width=True)
 
                 with col_form:
@@ -756,10 +758,9 @@ def main():
                 if del_indices:
                     for idx in sorted(del_indices, reverse=True):
                         data_list.pop(idx)
-                    st.session_state["images_for_review"] = [
-                        (fn, ib) for fn, ib in low_conf_images
-                        if fn not in deleted_files
-                    ]
+                    # 削除したレコードの画像もマップから除去
+                    for fn in deleted_files:
+                        st.session_state["all_images"].pop(fn, None)
 
                 st.session_state["extracted_data"] = data_list
                 applied = len(review_items) - len(del_indices)
